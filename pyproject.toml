@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "illust2psd"
+version = "0.1.0"
+description = "Convert anime character illustrations to layered PSD files for Live2D Cubism Editor"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "numpy>=1.24",
+    "Pillow>=10.0",
+    "opencv-python>=4.8",
+    "scipy>=1.11",
+    "click>=8.0",
+    "pyyaml>=6.0",
+    "loguru>=0.7",
+    "pytoshop>=1.0",
+    "six>=1.16",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "onnxruntime>=1.16",
+    "mediapipe>=0.10",
+    "simple-lama-inpainting",
+]
+gpu = [
+    "onnxruntime-gpu>=1.16",
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "mediapipe>=0.10",
+    "simple-lama-inpainting",
+]
+full = [
+    "onnxruntime-gpu>=1.16",
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "mediapipe>=0.10",
+    "simple-lama-inpainting",
+    "diffusers>=0.25",
+    "transformers>=4.35",
+    "accelerate>=0.25",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "black>=23.0",
+    "ruff>=0.1",
+    "mypy>=1.5",
+]
+
+[project.scripts]
+illust2psd = "illust2psd.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["illust2psd*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true

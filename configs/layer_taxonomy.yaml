@@ -1,0 +1,105 @@
+parts:
+  # --- Back layers (drawn first) ---
+  - id: back_hair
+    cubism_name: "Hair_Back"
+    z_order: 0
+    description: "Hair behind the head/body"
+
+  - id: body
+    cubism_name: "Body"
+    z_order: 100
+    description: "Torso/main body"
+
+  - id: left_arm_back
+    cubism_name: "Arm_L_Back"
+    z_order: 150
+    description: "Left upper arm (behind torso if applicable)"
+
+  - id: right_arm_back
+    cubism_name: "Arm_R_Back"
+    z_order: 150
+    description: "Right upper arm (behind torso if applicable)"
+
+  - id: left_leg
+    cubism_name: "Leg_L"
+    z_order: 200
+    description: "Left leg"
+
+  - id: right_leg
+    cubism_name: "Leg_R"
+    z_order: 200
+    description: "Right leg"
+
+  # --- Mid layers ---
+  - id: neck
+    cubism_name: "Neck"
+    z_order: 300
+    description: "Neck area"
+
+  - id: face_base
+    cubism_name: "Face"
+    z_order: 400
+    description: "Face skin area, no features"
+
+  - id: left_ear
+    cubism_name: "Ear_L"
+    z_order: 410
+    description: "Left ear"
+
+  - id: right_ear
+    cubism_name: "Ear_R"
+    z_order: 410
+    description: "Right ear"
+
+  # --- Face detail layers ---
+  - id: left_eye
+    cubism_name: "Eye_L"
+    z_order: 500
+    description: "Left eye"
+
+  - id: right_eye
+    cubism_name: "Eye_R"
+    z_order: 500
+    description: "Right eye"
+
+  - id: left_eyebrow
+    cubism_name: "Brow_L"
+    z_order: 550
+    description: "Left eyebrow"
+
+  - id: right_eyebrow
+    cubism_name: "Brow_R"
+    z_order: 550
+    description: "Right eyebrow"
+
+  - id: nose
+    cubism_name: "Nose"
+    z_order: 520
+    description: "Nose"
+
+  - id: mouth
+    cubism_name: "Mouth"
+    z_order: 530
+    description: "Mouth including lips"
+
+  # --- Front layers ---
+  - id: left_arm_front
+    cubism_name: "Arm_L_Front"
+    z_order: 600
+    description: "Left forearm/hand (in front)"
+
+  - id: right_arm_front
+    cubism_name: "Arm_R_Front"
+    z_order: 600
+    description: "Right forearm/hand (in front)"
+
+  - id: front_hair
+    cubism_name: "Hair_Front"
+    z_order: 700
+    description: "Bangs and hair in front of face"
+
+  # --- Accessories (optional) ---
+  - id: accessory
+    cubism_name: "Accessory"
+    z_order: 800
+    description: "Hats, ribbons, glasses, etc."

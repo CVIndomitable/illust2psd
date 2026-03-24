@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+*.psd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.onnx
+*.pt
+*.task
+.DS_Store

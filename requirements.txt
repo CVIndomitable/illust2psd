@@ -1,0 +1,9 @@
+numpy>=1.24
+Pillow>=10.0
+opencv-python>=4.8
+scipy>=1.11
+click>=8.0
+pyyaml>=6.0
+loguru>=0.7
+pytoshop>=1.0
+tqdm>=4.65
