@@ -168,18 +168,19 @@ def _segformer_segment(
     if "hair" in raw_masks:
         _split_hair(raw_masks, fg_mask, pose, h, w)
 
+    # Extract arms from body using keypoints
+    _extract_arms(raw_masks, fg_mask, pose, h, w)
+
     # Add neck: narrow strip between face and body
     if "face_base" in raw_masks and "body" in raw_masks:
         _add_neck(raw_masks, h, w)
 
     # Ensure all foreground pixels are assigned
-    # Unassigned fg pixels go to nearest part
     covered = np.zeros((h, w), dtype=bool)
     for m in raw_masks.values():
         covered |= m
     uncovered = fg_mask & ~covered
     if np.sum(uncovered) > 0:
-        # Large uncovered regions likely belong to body or back_hair
         if "back_hair" not in raw_masks:
             raw_masks["back_hair"] = uncovered
         else:
@@ -229,6 +230,162 @@ def _split_hair(
         masks["front_hair"] = front_hair
     if np.sum(back_hair) > 50:
         masks["back_hair"] = back_hair
+
+
+def _extract_arms(
+    masks: dict[str, np.ndarray],
+    fg_mask: np.ndarray,
+    pose: PoseResult,
+    h: int, w: int,
+) -> None:
+    """Extract arm regions from body mask using pose keypoints.
+
+    When SegFormer classifies clothed arms as "upper-clothes" (body),
+    we use shoulder→elbow→wrist keypoints to carve arm corridors out of
+    the body mask.
+
+    Strategy for each arm:
+    1. If SegFormer already detected it (skin visible), keep it.
+    2. Otherwise, draw a thick corridor from shoulder→elbow→wrist.
+    3. Intersect with (body | foreground) to get actual arm pixels.
+    4. Subtract from body mask.
+    5. Split into arm_back (shoulder→elbow) and arm_front (elbow→wrist).
+    """
+    body = masks.get("body")
+    if body is None:
+        return
+
+    # Get body bounding box for width reference
+    body_cols = np.where(np.any(body, axis=0))[0]
+    if len(body_cols) == 0:
+        return
+    body_w = body_cols[-1] - body_cols[0]
+    body_cx = (body_cols[0] + body_cols[-1]) / 2
+
+    for side in ["left", "right"]:
+        part_front = f"{side}_arm_front"
+        part_back = f"{side}_arm_back"
+
+        # Skip if SegFormer already detected this arm with reasonable size
+        if part_front in masks and np.sum(masks[part_front]) > 200:
+            continue
+
+        shoulder = pose.get(f"{side}_shoulder")
+        elbow = pose.get(f"{side}_elbow")
+        wrist = pose.get(f"{side}_wrist")
+
+        if not shoulder:
+            continue
+
+        # Determine if arm is on the outer side of body
+        # (helps decide corridor width and direction)
+        arm_is_outer = (side == "left" and shoulder.x < body_cx) or \
+                       (side == "right" and shoulder.x > body_cx)
+
+        # Corridor width: proportional to body width
+        corridor_w = max(10, int(body_w * 0.12))
+
+        # Build arm corridor mask
+        arm_mask = np.zeros((h, w), dtype=np.uint8)
+
+        if elbow:
+            # Shoulder to elbow
+            _draw_thick_line(arm_mask, shoulder, elbow, corridor_w)
+            if wrist:
+                # Elbow to wrist
+                _draw_thick_line(arm_mask, elbow, wrist, int(corridor_w * 0.85))
+        elif wrist:
+            # Direct shoulder to wrist
+            _draw_thick_line(arm_mask, shoulder, wrist, corridor_w)
+        else:
+            # Only shoulder known — extend outward and downward
+            # Estimate elbow at 60% body height from shoulder
+            body_rows = np.where(np.any(body, axis=1))[0]
+            if len(body_rows) == 0:
+                continue
+            body_h = body_rows[-1] - body_rows[0]
+            est_elbow_y = shoulder.y + body_h * 0.35
+            dx = -body_w * 0.25 if side == "left" else body_w * 0.25
+            est_elbow = Keypoint(shoulder.x + dx, est_elbow_y, 0.3)
+            _draw_thick_line(arm_mask, shoulder, est_elbow, corridor_w)
+
+        arm_bool = arm_mask > 0
+
+        # Intersect with foreground pixels that are in body or unclaimed
+        claimable = fg_mask & (body | ~_union_masks(masks))
+        arm_bool &= claimable
+
+        # Don't let arm eat too much of the body (max 30% of body pixels)
+        arm_px = np.sum(arm_bool)
+        body_px = np.sum(body)
+        if arm_px > body_px * 0.30:
+            # Too much — reduce corridor width and retry
+            arm_mask2 = np.zeros((h, w), dtype=np.uint8)
+            narrow_w = max(8, corridor_w // 2)
+            if elbow:
+                _draw_thick_line(arm_mask2, shoulder, elbow, narrow_w)
+                if wrist:
+                    _draw_thick_line(arm_mask2, elbow, wrist, narrow_w)
+            arm_bool = (arm_mask2 > 0) & claimable
+
+        if np.sum(arm_bool) < 50:
+            continue
+
+        # Split into back (shoulder→elbow) and front (elbow→wrist)
+        if elbow:
+            upper_mask = np.zeros((h, w), dtype=np.uint8)
+            _draw_thick_line(upper_mask, shoulder, elbow, corridor_w + 4)  # slightly wider to capture
+            upper_region = upper_mask > 0
+
+            arm_back = arm_bool & upper_region
+            arm_front = arm_bool & ~upper_region
+
+            if np.sum(arm_back) > 30:
+                masks[part_back] = arm_back
+            if np.sum(arm_front) > 30:
+                masks[part_front] = arm_front
+
+            # If one part is empty, put everything in front
+            if np.sum(arm_front) <= 30 and np.sum(arm_back) > 30:
+                masks[part_front] = arm_bool
+                if part_back in masks:
+                    del masks[part_back]
+        else:
+            # No elbow — all goes to arm_front
+            masks[part_front] = arm_bool
+
+        # Subtract extracted arm from body
+        total_arm = np.zeros((h, w), dtype=bool)
+        if part_back in masks:
+            total_arm |= masks[part_back]
+        if part_front in masks:
+            total_arm |= masks[part_front]
+        masks["body"] = masks["body"] & ~total_arm
+
+        logger.debug(f"Extracted {side} arm: {int(np.sum(total_arm))} px from body")
+
+
+def _draw_thick_line(
+    canvas: np.ndarray,
+    kp_a: Keypoint,
+    kp_b: Keypoint,
+    thickness: int,
+) -> None:
+    """Draw a thick line between two keypoints on a uint8 canvas."""
+    pt1 = (int(kp_a.x), int(kp_a.y))
+    pt2 = (int(kp_b.x), int(kp_b.y))
+    cv2.line(canvas, pt1, pt2, 255, max(1, thickness))
+
+
+def _union_masks(masks: dict[str, np.ndarray]) -> np.ndarray:
+    """Union all masks into a single boolean array."""
+    result = None
+    for m in masks.values():
+        if result is None:
+            result = m.copy()
+        else:
+            result |= m
+    return result if result is not None else np.zeros((1, 1), dtype=bool)
 
 
 def _add_neck(masks: dict[str, np.ndarray], h: int, w: int) -> None:
