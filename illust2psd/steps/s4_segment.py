@@ -168,23 +168,16 @@ def _segformer_segment(
     if "hair" in raw_masks:
         _split_hair(raw_masks, fg_mask, pose, h, w)
 
-    # Extract arms from body using keypoints
+    # Extract arms and legs from body using keypoints
     _extract_arms(raw_masks, fg_mask, pose, h, w)
+    _extract_legs(raw_masks, fg_mask, pose, h, w)
 
     # Add neck: narrow strip between face and body
     if "face_base" in raw_masks and "body" in raw_masks:
         _add_neck(raw_masks, h, w)
 
-    # Ensure all foreground pixels are assigned
-    covered = np.zeros((h, w), dtype=bool)
-    for m in raw_masks.values():
-        covered |= m
-    uncovered = fg_mask & ~covered
-    if np.sum(uncovered) > 0:
-        if "back_hair" not in raw_masks:
-            raw_masks["back_hair"] = uncovered
-        else:
-            raw_masks["back_hair"] |= uncovered
+    # Assign uncovered foreground pixels intelligently
+    _assign_uncovered_smart(raw_masks, fg_mask, h, w)
 
     return raw_masks
 
@@ -311,9 +304,8 @@ def _extract_arms(
 
         arm_bool = arm_mask > 0
 
-        # Intersect with foreground pixels that are in body or unclaimed
-        claimable = fg_mask & (body | ~_union_masks(masks))
-        arm_bool &= claimable
+        # Only carve from body mask — don't grab unclaimed pixels (weapons, accessories)
+        arm_bool &= body
 
         # Don't let arm eat too much of the body (max 30% of body pixels)
         arm_px = np.sum(arm_bool)
@@ -326,7 +318,7 @@ def _extract_arms(
                 _draw_thick_line(arm_mask2, shoulder, elbow, narrow_w)
                 if wrist:
                     _draw_thick_line(arm_mask2, elbow, wrist, narrow_w)
-            arm_bool = (arm_mask2 > 0) & claimable
+            arm_bool = (arm_mask2 > 0) & body
 
         if np.sum(arm_bool) < 50:
             continue
@@ -365,6 +357,95 @@ def _extract_arms(
         logger.debug(f"Extracted {side} arm: {int(np.sum(total_arm))} px from body")
 
 
+def _extract_legs(
+    masks: dict[str, np.ndarray],
+    fg_mask: np.ndarray,
+    pose: PoseResult,
+    h: int, w: int,
+) -> None:
+    """Extract leg regions from body mask using pose keypoints.
+
+    When SegFormer classifies stockings/tights as clothing (body),
+    we use hip→knee→ankle keypoints to carve leg regions out.
+    Only activates if legs weren't already detected by SegFormer.
+    """
+    body = masks.get("body")
+    if body is None:
+        return
+
+    for side in ["left", "right"]:
+        part_id = f"{side}_leg"
+
+        # Skip if SegFormer already detected a substantial leg
+        # (shoes alone don't count — need at least 2% of body pixels)
+        body_px = np.sum(body)
+        if part_id in masks and np.sum(masks[part_id]) > body_px * 0.02:
+            continue
+
+        hip = pose.get(f"{side}_hip")
+        knee = pose.get(f"{side}_knee")
+        ankle = pose.get(f"{side}_ankle")
+
+        if not hip:
+            continue
+
+        # Get body bbox for width reference
+        body_cols = np.where(np.any(body, axis=0))[0]
+        if len(body_cols) == 0:
+            continue
+        body_w = body_cols[-1] - body_cols[0]
+        corridor_w = max(10, int(body_w * 0.14))
+
+        leg_mask = np.zeros((h, w), dtype=np.uint8)
+
+        if knee:
+            _draw_thick_line(leg_mask, hip, knee, corridor_w)
+            if ankle:
+                _draw_thick_line(leg_mask, knee, ankle, int(corridor_w * 0.9))
+        elif ankle:
+            _draw_thick_line(leg_mask, hip, ankle, corridor_w)
+        else:
+            # Estimate: leg extends straight down from hip
+            est_ankle = Keypoint(hip.x, h * 0.95, 0.3)
+            _draw_thick_line(leg_mask, hip, est_ankle, corridor_w)
+
+        leg_bool = (leg_mask > 0) & body
+
+        # Legs should be in the lower portion of the body mask
+        body_rows = np.where(np.any(body, axis=1))[0]
+        if len(body_rows) == 0:
+            continue
+        body_mid_y = body_rows[len(body_rows) // 2]
+        # Only keep leg pixels below the body midpoint
+        lower_region = np.zeros((h, w), dtype=bool)
+        lower_region[int(body_mid_y):, :] = True
+        leg_bool &= lower_region
+
+        # Size check: don't let leg eat too much
+        if np.sum(leg_bool) > np.sum(body) * 0.35:
+            # Narrow the corridor
+            leg_mask2 = np.zeros((h, w), dtype=np.uint8)
+            narrow_w = max(8, corridor_w // 2)
+            if knee:
+                _draw_thick_line(leg_mask2, hip, knee, narrow_w)
+                if ankle:
+                    _draw_thick_line(leg_mask2, knee, ankle, narrow_w)
+            leg_bool = (leg_mask2 > 0) & body & lower_region
+
+        if np.sum(leg_bool) < 50:
+            continue
+
+        # Merge with existing leg mask if any
+        if part_id in masks:
+            masks[part_id] |= leg_bool
+        else:
+            masks[part_id] = leg_bool
+
+        # Subtract from body
+        masks["body"] = masks["body"] & ~leg_bool
+        logger.debug(f"Extracted {side} leg: {int(np.sum(leg_bool))} px from body")
+
+
 def _draw_thick_line(
     canvas: np.ndarray,
     kp_a: Keypoint,
@@ -386,6 +467,101 @@ def _union_masks(masks: dict[str, np.ndarray]) -> np.ndarray:
         else:
             result |= m
     return result if result is not None else np.zeros((1, 1), dtype=bool)
+
+
+def _assign_uncovered_smart(
+    masks: dict[str, np.ndarray],
+    fg_mask: np.ndarray,
+    h: int, w: int,
+) -> None:
+    """Assign uncovered foreground pixels to the nearest existing part,
+    with spatial constraints to prevent hair from absorbing body-area junk.
+
+    Rules:
+    - Pixels in the head region (top 25%) can go to any part
+    - Pixels below the head region cannot go to hair parts
+    - Remaining unassigned pixels go to body (clothes/accessories)
+    """
+    from scipy import ndimage as ndi
+
+    covered = _union_masks(masks) if masks else np.zeros((h, w), dtype=bool)
+    uncovered = fg_mask & ~covered
+
+    uncovered_count = int(np.sum(uncovered))
+    if uncovered_count == 0:
+        return
+
+    if not masks:
+        masks["body"] = uncovered
+        return
+
+    # Find head boundary: use face position (not hair, which can flow far down)
+    head_bottom = h * 0.25  # default: top 25%
+    for pid in ["face_base", "front_hair"]:  # NOT back_hair — it flows too far
+        if pid in masks and np.any(masks[pid]):
+            rows = np.where(np.any(masks[pid], axis=1))[0]
+            if len(rows) > 0:
+                head_bottom = max(head_bottom, rows[-1] + h * 0.05)
+    # Cap head region at 40% of image max (even with high face)
+    head_bottom = min(head_bottom, h * 0.40)
+
+    head_region = np.zeros((h, w), dtype=bool)
+    head_region[:int(min(head_bottom, h * 0.45)), :] = True
+
+    hair_parts = {"front_hair", "back_hair"}
+
+    # Build label maps as full (h,w) arrays for correct broadcasting
+    label_map_full = np.zeros((h, w), dtype=np.int32)
+    label_map_no_hair = np.zeros((h, w), dtype=np.int32)
+    part_ids = list(masks.keys())
+
+    for i, pid in enumerate(part_ids, 1):
+        label_map_full[masks[pid]] = i
+        if pid not in hair_parts:
+            label_map_no_hair[masks[pid]] = i
+
+    # Pre-compute nearest-label maps (full h,w) for correct pixel assignment
+    # Map 1: nearest label from ALL parts (for head region)
+    nearest_full = np.zeros((h, w), dtype=np.int32)
+    unlabeled_full = label_map_full == 0
+    if np.any(~unlabeled_full):
+        _, idx_full = ndi.distance_transform_edt(unlabeled_full, return_indices=True)
+        nearest_full = label_map_full[idx_full[0], idx_full[1]]
+
+    # Map 2: nearest label from NON-HAIR parts only (for body region)
+    nearest_no_hair = np.zeros((h, w), dtype=np.int32)
+    unlabeled_nh = label_map_no_hair == 0
+    if np.any(~unlabeled_nh):
+        _, idx_nh = ndi.distance_transform_edt(unlabeled_nh, return_indices=True)
+        nearest_no_hair = label_map_no_hair[idx_nh[0], idx_nh[1]]
+
+    # Head-region uncovered pixels → assign to nearest ANY part
+    uncov_head = uncovered & head_region
+    # Body-region uncovered pixels → assign to nearest NON-HAIR part
+    uncov_body = uncovered & ~head_region
+
+    for i, pid in enumerate(part_ids, 1):
+        # Head region: any part
+        head_px = uncov_head & (nearest_full == i)
+        if np.any(head_px):
+            masks[pid] |= head_px
+
+        # Body region: non-hair parts only
+        if pid not in hair_parts:
+            body_px = uncov_body & (nearest_no_hair == i)
+            if np.any(body_px):
+                masks[pid] |= body_px
+
+    # Any still uncovered goes to body
+    still_uncovered = fg_mask & ~_union_masks(masks)
+    if np.any(still_uncovered):
+        masks.setdefault("body", np.zeros((h, w), dtype=bool))
+        masks["body"] |= still_uncovered
+
+    logger.debug(
+        f"Assigned {uncovered_count} uncovered px "
+        f"(head→any: {int(np.sum(uncov_head))}, body→non-hair: {int(np.sum(uncov_body))})"
+    )
 
 
 def _add_neck(masks: dict[str, np.ndarray], h: int, w: int) -> None:
