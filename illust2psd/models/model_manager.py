@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from loguru import logger
 
 
@@ -19,6 +21,8 @@ class ModelManager:
         self._sam2_device = None
         self._isnet_session = None
         self._isnet_device = None
+        self._segformer_processor = None
+        self._segformer_model = None
 
     @classmethod
     def get(cls) -> ModelManager:
@@ -78,10 +82,42 @@ class ModelManager:
         logger.info("ISNet ready")
         return self._isnet_session
 
+    def get_segformer(self) -> tuple:
+        """Get or create SegFormer human parsing model (processor, model).
+
+        Uses mattmdjaga/segformer_b2_clothes (ATR dataset, 18 classes).
+        """
+        if self._segformer_processor is not None:
+            return self._segformer_processor, self._segformer_model
+
+        from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+
+        model_id = "mattmdjaga/segformer_b2_clothes"
+        logger.info(f"Loading SegFormer ({model_id})...")
+
+        # Set proxy env for HuggingFace download if local proxy is available
+        import socket
+        try:
+            sock = socket.create_connection(("127.0.0.1", 7897), timeout=1)
+            sock.close()
+            os.environ.setdefault("HTTPS_PROXY", "http://127.0.0.1:7897")
+            os.environ.setdefault("HTTP_PROXY", "http://127.0.0.1:7897")
+        except (ConnectionRefusedError, OSError, socket.timeout):
+            pass
+
+        self._segformer_processor = SegformerImageProcessor.from_pretrained(model_id)
+        self._segformer_model = SegformerForSemanticSegmentation.from_pretrained(model_id)
+        self._segformer_model.eval()
+
+        logger.info("SegFormer ready (ATR 18-class)")
+        return self._segformer_processor, self._segformer_model
+
     def clear(self) -> None:
         """Release all loaded models."""
         self._sam2_predictor = None
         self._sam2_device = None
         self._isnet_session = None
         self._isnet_device = None
+        self._segformer_processor = None
+        self._segformer_model = None
         logger.info("All models released")

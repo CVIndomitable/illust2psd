@@ -1,12 +1,13 @@
 """S4: Semantic Body Part Segmentation — core step.
 
-Produces per-part binary masks using SAM2 point prompts or heuristic regions.
+Primary: SegFormer human parsing (ATR 18-class) for semantic body part masks.
+Fallback: Heuristic keypoint-guided regions.
+Optional: SAM2 for refinement.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -15,7 +16,7 @@ from PIL import Image
 
 from illust2psd.config import PipelineConfig, get_taxonomy, get_z_order_map
 from illust2psd.steps.s3_pose import Keypoint, PoseResult
-from illust2psd.utils.mask_utils import remove_small_components
+from illust2psd.utils.mask_utils import close_mask, fill_holes, remove_small_components
 
 
 @dataclass
@@ -27,55 +28,28 @@ class SegmentResult:
     method: str
 
 
-# Maps part_id to keypoint names used to compute center prompt
-# and additional negative prompt points (to exclude nearby parts)
-_PART_PROMPTS: dict[str, dict] = {
-    "face_base": {
-        "positive": ["nose", "left_eye", "right_eye"],
-        "negative": ["left_shoulder", "right_shoulder"],
-        "max_ratio": 0.15,  # Max fraction of image area
-    },
-    "neck": {
-        "positive": ["left_shoulder", "right_shoulder"],
-        "offset_y": -0.3,  # Move point slightly above shoulders toward neck
-        "negative": ["nose", "left_hip"],
-        "max_ratio": 0.05,
-    },
-    "body": {
-        "positive": ["left_shoulder", "right_shoulder", "left_hip", "right_hip"],
-        "negative": [],
-        "max_ratio": 0.30,
-    },
-    "left_arm_back": {
-        "positive": ["left_shoulder", "left_elbow"],
-        "negative": ["right_shoulder"],
-        "max_ratio": 0.10,
-    },
-    "right_arm_back": {
-        "positive": ["right_shoulder", "right_elbow"],
-        "negative": ["left_shoulder"],
-        "max_ratio": 0.10,
-    },
-    "left_arm_front": {
-        "positive": ["left_elbow", "left_wrist"],
-        "negative": ["left_shoulder"],
-        "max_ratio": 0.10,
-    },
-    "right_arm_front": {
-        "positive": ["right_elbow", "right_wrist"],
-        "negative": ["right_shoulder"],
-        "max_ratio": 0.10,
-    },
-    "left_leg": {
-        "positive": ["left_hip", "left_knee", "left_ankle"],
-        "negative": ["right_hip"],
-        "max_ratio": 0.15,
-    },
-    "right_leg": {
-        "positive": ["right_hip", "right_knee", "right_ankle"],
-        "negative": ["left_hip"],
-        "max_ratio": 0.15,
-    },
+# ATR label ID → our part_id mapping
+# ATR: 0=Background, 1=Hat, 2=Hair, 3=Sunglasses, 4=Upper-clothes, 5=Skirt,
+#       6=Pants, 7=Dress, 8=Belt, 9=Left-shoe, 10=Right-shoe, 11=Face,
+#       12=Left-leg, 13=Right-leg, 14=Left-arm, 15=Right-arm, 16=Bag, 17=Scarf
+_ATR_TO_PART = {
+    1: "accessory",      # Hat
+    2: "hair",           # Hair (split into front/back later)
+    3: "accessory",      # Sunglasses
+    4: "body",           # Upper-clothes
+    5: "body",           # Skirt → body
+    6: "body",           # Pants → body
+    7: "body",           # Dress → body
+    8: "body",           # Belt → body
+    9: "left_leg",       # Left-shoe → merge into left_leg
+    10: "right_leg",     # Right-shoe → merge into right_leg
+    11: "face_base",     # Face
+    12: "left_leg",      # Left-leg
+    13: "right_leg",     # Right-leg
+    14: "left_arm_front",  # Left-arm
+    15: "right_arm_front", # Right-arm
+    16: "accessory",     # Bag
+    17: "accessory",     # Scarf
 }
 
 
@@ -88,8 +62,9 @@ def segment(
     """Segment character into body parts.
 
     Strategy:
-    1. SAM2 with point prompts from keypoints
-    2. Heuristic region-based fallback
+    1. SegFormer human parsing (best for anime)
+    2. SAM2 with point prompts (optional refinement)
+    3. Heuristic region-based fallback
 
     Args:
         image: RGBA PIL Image
@@ -100,23 +75,41 @@ def segment(
     Returns:
         SegmentResult with per-part masks
     """
-    if config.segmentation_backend == "sam2":
+    backend = config.segmentation_backend
+
+    if backend == "segformer":
+        try:
+            masks = _segformer_segment(image, fg_mask, pose, config)
+            method = "segformer"
+            logger.info(f"Segmentation with SegFormer: {len(masks)} parts")
+        except Exception as e:
+            logger.warning(f"SegFormer failed: {e}, falling back to heuristic")
+            masks = _heuristic_segment(image, fg_mask, pose, config)
+            method = "heuristic"
+    elif backend == "sam2":
         try:
             masks = _sam2_segment(image, fg_mask, pose, config)
+            method = "sam2"
             logger.info(f"Segmentation with SAM2: {len(masks)} parts")
         except Exception as e:
             logger.warning(f"SAM2 failed: {e}, falling back to heuristic")
             masks = _heuristic_segment(image, fg_mask, pose, config)
+            method = "heuristic"
     else:
         masks = _heuristic_segment(image, fg_mask, pose, config)
+        method = "heuristic"
 
     # Stage B: Refine with foreground mask
     for part_id in masks:
         masks[part_id] = masks[part_id] & fg_mask
 
-    # Remove small components
-    for part_id in masks:
+    # Clean up masks
+    for part_id in list(masks.keys()):
+        masks[part_id] = close_mask(masks[part_id], 3)
+        masks[part_id] = fill_holes(masks[part_id])
         masks[part_id] = remove_small_components(masks[part_id], config.mask_min_part_pixels)
+        if not np.any(masks[part_id]):
+            del masks[part_id]
 
     # Store full masks before overlap removal
     full_masks = {k: v.copy() for k, v in masks.items()}
@@ -127,9 +120,167 @@ def segment(
     # Stage D: Validate coverage
     _validate_coverage(masks, fg_mask)
 
-    method = config.segmentation_backend
     return SegmentResult(masks=masks, full_masks=full_masks, method=method)
 
+
+# ============================================================
+# SegFormer backend
+# ============================================================
+
+def _segformer_segment(
+    image: Image.Image,
+    fg_mask: np.ndarray,
+    pose: PoseResult,
+    config: PipelineConfig,
+) -> dict[str, np.ndarray]:
+    """Segment using SegFormer human parsing model (ATR 18-class)."""
+    import torch
+
+    from illust2psd.models.model_manager import ModelManager
+
+    processor, model = ModelManager.get().get_segformer()
+
+    rgb = image.convert("RGB")
+    h, w = fg_mask.shape
+
+    inputs = processor(images=rgb, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    logits = outputs.logits  # (1, 18, H/4, W/4)
+    upsampled = torch.nn.functional.interpolate(
+        logits, size=(h, w), mode="bilinear", align_corners=False,
+    )
+    seg_map = upsampled.argmax(dim=1).squeeze().cpu().numpy()
+
+    # Convert ATR labels to our part taxonomy
+    raw_masks: dict[str, np.ndarray] = {}
+    for atr_id, part_id in _ATR_TO_PART.items():
+        atr_mask = seg_map == atr_id
+        if not np.any(atr_mask):
+            continue
+        if part_id in raw_masks:
+            raw_masks[part_id] |= atr_mask
+        else:
+            raw_masks[part_id] = atr_mask.copy()
+
+    # Split hair into front_hair and back_hair
+    if "hair" in raw_masks:
+        _split_hair(raw_masks, fg_mask, pose, h, w)
+
+    # Add neck: narrow strip between face and body
+    if "face_base" in raw_masks and "body" in raw_masks:
+        _add_neck(raw_masks, h, w)
+
+    # Ensure all foreground pixels are assigned
+    # Unassigned fg pixels go to nearest part
+    covered = np.zeros((h, w), dtype=bool)
+    for m in raw_masks.values():
+        covered |= m
+    uncovered = fg_mask & ~covered
+    if np.sum(uncovered) > 0:
+        # Large uncovered regions likely belong to body or back_hair
+        if "back_hair" not in raw_masks:
+            raw_masks["back_hair"] = uncovered
+        else:
+            raw_masks["back_hair"] |= uncovered
+
+    return raw_masks
+
+
+def _split_hair(
+    masks: dict[str, np.ndarray],
+    fg_mask: np.ndarray,
+    pose: PoseResult,
+    h: int, w: int,
+) -> None:
+    """Split combined hair mask into front_hair and back_hair.
+
+    Front hair = hair pixels above and overlapping the face region (bangs).
+    Back hair = everything else (behind/below head).
+    """
+    hair = masks.pop("hair")
+
+    # Find face center Y as split reference
+    face = masks.get("face_base")
+    if face is not None and np.any(face):
+        face_rows = np.where(np.any(face, axis=1))[0]
+        face_top = face_rows[0]
+        face_mid = face_rows[len(face_rows) // 3]  # Upper third of face
+    else:
+        # Estimate from foreground bounding box
+        fg_rows = np.where(np.any(fg_mask, axis=1))[0]
+        face_top = fg_rows[0]
+        face_mid = fg_rows[0] + (fg_rows[-1] - fg_rows[0]) * 0.12
+
+    # Front hair: hair pixels above the upper-third of face
+    front_region = np.zeros((h, w), dtype=bool)
+    front_region[:int(face_mid), :] = True
+    front_hair = hair & front_region
+
+    # Also include any hair overlapping with face (bangs hanging over forehead)
+    if face is not None:
+        bangs_overlap = hair & face
+        front_hair |= bangs_overlap
+
+    back_hair = hair & ~front_hair
+
+    if np.sum(front_hair) > 50:
+        masks["front_hair"] = front_hair
+    if np.sum(back_hair) > 50:
+        masks["back_hair"] = back_hair
+
+
+def _add_neck(masks: dict[str, np.ndarray], h: int, w: int) -> None:
+    """Create neck region between face bottom and body top."""
+    face = masks["face_base"]
+    body = masks["body"]
+
+    face_rows = np.where(np.any(face, axis=1))[0]
+    body_rows = np.where(np.any(body, axis=1))[0]
+
+    if len(face_rows) == 0 or len(body_rows) == 0:
+        return
+
+    face_bottom = face_rows[-1]
+    body_top = body_rows[0]
+
+    if body_top <= face_bottom:
+        # Face and body overlap — neck is the thin gap
+        gap = max(3, int((face_bottom - body_top) * 0.3))
+        neck_y_start = face_bottom - gap
+        neck_y_end = face_bottom + gap
+    else:
+        # There's a gap between face and body
+        neck_y_start = face_bottom
+        neck_y_end = body_top
+
+    # Neck width: narrower than face
+    face_cols = np.where(np.any(face, axis=0))[0]
+    if len(face_cols) == 0:
+        return
+    face_cx = (face_cols[0] + face_cols[-1]) // 2
+    face_w = face_cols[-1] - face_cols[0]
+    neck_half_w = max(5, face_w // 4)
+
+    neck = np.zeros((h, w), dtype=bool)
+    y1 = max(0, neck_y_start)
+    y2 = min(h, neck_y_end)
+    x1 = max(0, face_cx - neck_half_w)
+    x2 = min(w, face_cx + neck_half_w)
+    neck[y1:y2, x1:x2] = True
+
+    # Only keep neck pixels that are in the foreground and not in face/body
+    fg_here = face | body
+    neck &= ~face & ~body
+
+    if np.sum(neck) > 20:
+        masks["neck"] = neck
+
+
+# ============================================================
+# SAM2 backend (kept for optional refinement)
+# ============================================================
 
 def _sam2_segment(
     image: Image.Image,
@@ -137,208 +288,62 @@ def _sam2_segment(
     pose: PoseResult,
     config: PipelineConfig,
 ) -> dict[str, np.ndarray]:
-    """Segment using SAM2 with point prompts from keypoints."""
+    """Segment using SAM2 — use SegFormer as coarse, SAM2 for refinement."""
+    # First get coarse segmentation from SegFormer
+    try:
+        coarse = _segformer_segment(image, fg_mask, pose, config)
+    except Exception:
+        coarse = _heuristic_segment(image, fg_mask, pose, config)
+
+    # Then refine each part with SAM2 using centroid prompts
     from illust2psd.models.model_manager import ModelManager
 
     predictor = ModelManager.get().get_sam2_predictor(config.device)
 
     arr = np.array(image)[:, :, :3]
     predictor.set_image(arr)
-
     h, w = arr.shape[:2]
-    total_pixels = h * w
-    masks = {}
 
-    # Get masks for keypoint-based parts using positive + negative prompts
-    for part_id, prompt_info in _PART_PROMPTS.items():
-        pos_names = prompt_info["positive"]
-        neg_names = prompt_info.get("negative", [])
-        max_ratio = prompt_info.get("max_ratio", 0.20)
-
-        # Compute positive points
-        pos_points = []
-        for name in pos_names:
-            kp = pose.get(name)
-            if kp:
-                pos_points.append([kp.x, kp.y])
-
-        if not pos_points:
+    refined = {}
+    for part_id, mask in coarse.items():
+        if np.sum(mask) < 50:
+            refined[part_id] = mask
             continue
 
-        # Apply offset if specified
-        offset_y = prompt_info.get("offset_y", 0.0)
-        if offset_y != 0.0 and len(pos_points) >= 2:
-            center_y = np.mean([p[1] for p in pos_points])
-            dy = (pos_points[0][1] - pos_points[-1][1]) * offset_y
-            for p in pos_points:
-                p[1] += dy
+        # Get centroid of coarse mask
+        ys, xs = np.where(mask)
+        cx, cy = np.mean(xs), np.mean(ys)
 
-        # Compute negative points
-        neg_points = []
-        for name in neg_names:
-            kp = pose.get(name)
-            if kp:
-                neg_points.append([kp.x, kp.y])
-
-        # Build coordinate and label arrays
-        all_points = pos_points + neg_points
-        all_labels = [1] * len(pos_points) + [0] * len(neg_points)
-
-        point_coords = np.array(all_points, dtype=np.float32)
-        point_labels = np.array(all_labels, dtype=np.int32)
-
-        # Clamp to image bounds
-        point_coords[:, 0] = np.clip(point_coords[:, 0], 0, w - 1)
-        point_coords[:, 1] = np.clip(point_coords[:, 1], 0, h - 1)
-
-        pred_masks, scores, _ = predictor.predict(
-            point_coords=point_coords,
-            point_labels=point_labels,
-            multimask_output=True,
-        )
-
-        # Pick best mask that isn't too large
-        sorted_idx = np.argsort(-scores)
-        for idx in sorted_idx:
-            candidate = pred_masks[idx].astype(bool)
-            ratio = np.sum(candidate) / total_pixels
-            if ratio <= max_ratio:
-                masks[part_id] = candidate
-                break
-        else:
-            # All too large — pick smallest
-            sizes = [np.sum(pred_masks[i]) for i in range(len(scores))]
-            masks[part_id] = pred_masks[np.argmin(sizes)].astype(bool)
-
-    # Hair: use subtraction approach with SAM assist
-    _add_hair_masks_sam2(masks, image, fg_mask, pose, predictor, h, w)
-
-    # Ears
-    _add_ear_masks_sam2(masks, pose, predictor, h, w)
-
-    return masks
-
-
-def _add_hair_masks_sam2(
-    masks: dict[str, np.ndarray],
-    image: Image.Image,
-    fg_mask: np.ndarray,
-    pose: PoseResult,
-    predictor,
-    h: int, w: int,
-) -> None:
-    """Add hair masks using SAM2 + subtraction strategy.
-
-    Front hair: SAM2 prompt at top-of-head, constrained above eyes.
-    Back hair: Everything in foreground not claimed by other parts.
-    """
-    # Compute head top region for front hair prompt
-    face_kp = pose.get("nose")
-    eye_l = pose.get("left_eye")
-    eye_r = pose.get("right_eye")
-
-    if face_kp is None:
-        return
-
-    # Find the top of the foreground (likely top of hair)
-    fg_rows = np.any(fg_mask, axis=1)
-    if not fg_rows.any():
-        return
-    fg_top = np.where(fg_rows)[0][0]
-
-    # Front hair prompt: midpoint between head top and eyes
-    if eye_l and eye_r:
-        eye_y = min(eye_l.y, eye_r.y)
-        eye_cx = (eye_l.x + eye_r.x) / 2
-    else:
-        eye_y = face_kp.y - h * 0.03
-        eye_cx = face_kp.x
-
-    hair_prompt_y = (fg_top + eye_y) / 2
-    hair_prompt_x = eye_cx
-
-    # SAM2 prompt for front hair
-    point_coords = np.array([[hair_prompt_x, hair_prompt_y]], dtype=np.float32)
-    point_labels = np.array([1], dtype=np.int32)
-    point_coords[:, 0] = np.clip(point_coords[:, 0], 0, w - 1)
-    point_coords[:, 1] = np.clip(point_coords[:, 1], 0, h - 1)
-
-    try:
-        pred_masks, scores, _ = predictor.predict(
-            point_coords=point_coords,
-            point_labels=point_labels,
-            multimask_output=True,
-        )
-        best_idx = np.argmax(scores)
-        hair_mask = pred_masks[best_idx].astype(bool) & fg_mask
-
-        # Front hair = hair above eyes
-        front_region = np.zeros((h, w), dtype=bool)
-        front_region[:int(eye_y + h * 0.02), :] = True
-        front_hair = hair_mask & front_region
-
-        # Subtract face
-        if "face_base" in masks:
-            front_hair &= ~masks["face_base"]
-
-        if np.sum(front_hair) > 100:
-            masks["front_hair"] = front_hair
-    except Exception as e:
-        logger.debug(f"SAM2 hair prompt failed: {e}")
-
-    # Back hair: everything unclaimed
-    covered = np.zeros((h, w), dtype=bool)
-    for pid, m in masks.items():
-        covered |= m
-    back_hair = fg_mask & ~covered
-    if np.sum(back_hair) > 100:
-        masks["back_hair"] = back_hair
-
-
-def _add_ear_masks_sam2(
-    masks: dict[str, np.ndarray],
-    pose: PoseResult,
-    predictor,
-    h: int, w: int,
-) -> None:
-    """Add ear masks using SAM2 point prompts with size constraint."""
-    for part_id, kp_name in [("left_ear", "left_ear"), ("right_ear", "right_ear")]:
-        kp = pose.get(kp_name)
-        if kp is None:
-            continue
-        point_coords = np.array([[kp.x, kp.y]], dtype=np.float32)
+        point_coords = np.array([[cx, cy]], dtype=np.float32)
         point_labels = np.array([1], dtype=np.int32)
-        point_coords[:, 0] = np.clip(point_coords[:, 0], 0, w - 1)
-        point_coords[:, 1] = np.clip(point_coords[:, 1], 0, h - 1)
+
         try:
             pred_masks, scores, _ = predictor.predict(
                 point_coords=point_coords,
                 point_labels=point_labels,
                 multimask_output=True,
             )
-            # Pick smallest reasonable mask (ears are small)
-            for idx in np.argsort([np.sum(m) for m in pred_masks]):
-                mask = pred_masks[idx].astype(bool)
-                ratio = np.sum(mask) / (h * w)
-                if 0.001 < ratio < 0.03:
-                    masks[part_id] = mask
-                    break
+            # Pick the mask most similar to our coarse mask (highest IoU)
+            best_iou = -1
+            best_mask = mask
+            for i in range(len(scores)):
+                candidate = pred_masks[i].astype(bool)
+                intersection = np.sum(candidate & mask)
+                union = np.sum(candidate | mask)
+                iou = intersection / max(union, 1)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_mask = candidate
+            refined[part_id] = best_mask
         except Exception:
-            pass
+            refined[part_id] = mask
+
+    return refined
 
 
-def _compute_center(pose: PoseResult, kp_names: list[str]) -> tuple[float, float] | None:
-    """Compute center point from multiple keypoints."""
-    xs, ys = [], []
-    for name in kp_names:
-        kp = pose.get(name)
-        if kp:
-            xs.append(kp.x)
-            ys.append(kp.y)
-    if not xs:
-        return None
-    return (np.mean(xs), np.mean(ys))
-
+# ============================================================
+# Heuristic backend
+# ============================================================
 
 def _heuristic_segment(
     image: Image.Image,
@@ -346,7 +351,7 @@ def _heuristic_segment(
     pose: PoseResult,
     config: PipelineConfig,
 ) -> dict[str, np.ndarray]:
-    """Segment using keypoint-guided bounding boxes and region analysis."""
+    """Segment using keypoint-guided bounding boxes."""
     h, w = fg_mask.shape
     masks = {}
 
@@ -374,8 +379,7 @@ def _heuristic_segment(
     masks["body"] = _rect_mask(h, w, cx - body_half, shoulder_y,
                                 cx + body_half, hip_y) & fg_mask
 
-    # Arms
-    for side, prefix in [("left", "left"), ("right", "right")]:
+    for prefix in ["left", "right"]:
         shoulder = pose.get(f"{prefix}_shoulder")
         elbow = pose.get(f"{prefix}_elbow")
         wrist = pose.get(f"{prefix}_wrist")
@@ -384,14 +388,12 @@ def _heuristic_segment(
         if elbow and wrist:
             masks[f"{prefix}_arm_front"] = _limb_mask(h, w, elbow, wrist, fg_w * 0.07) & fg_mask
 
-    # Legs
-    for side, prefix in [("left", "left"), ("right", "right")]:
+    for prefix in ["left", "right"]:
         hip = pose.get(f"{prefix}_hip")
         ankle = pose.get(f"{prefix}_ankle")
         if hip and ankle:
             masks[f"{prefix}_leg"] = _limb_mask(h, w, hip, ankle, fg_w * 0.10) & fg_mask
 
-    # Hair
     eye_y = y_min + fg_h * 0.10
     front_hair = _rect_mask(h, w, x_min, y_min, x_max, eye_y + fg_h * 0.02) & fg_mask
     if "face_base" in masks:
@@ -408,6 +410,10 @@ def _heuristic_segment(
 
     return masks
 
+
+# ============================================================
+# Shared utilities
+# ============================================================
 
 def _rect_mask(h: int, w: int, x1: float, y1: float, x2: float, y2: float) -> np.ndarray:
     mask = np.zeros((h, w), dtype=bool)
@@ -431,8 +437,10 @@ def _limb_mask(h: int, w: int, kp_a: Keypoint, kp_b: Keypoint, width: float) -> 
 def _resolve_overlaps(masks: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Resolve overlapping masks: highest z_order wins each pixel."""
     z_map = get_z_order_map()
-    h, w = next(iter(masks.values())).shape
+    if not masks:
+        return masks
 
+    h, w = next(iter(masks.values())).shape
     pixel_owner = np.full((h, w), -1, dtype=np.int32)
     pixel_z = np.full((h, w), -1, dtype=np.int32)
 
@@ -453,6 +461,9 @@ def _resolve_overlaps(masks: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 
 def _validate_coverage(masks: dict[str, np.ndarray], fg_mask: np.ndarray) -> None:
     """Check that masks cover most of the foreground."""
+    if not masks:
+        return
+
     union = np.zeros_like(fg_mask)
     for m in masks.values():
         union |= m

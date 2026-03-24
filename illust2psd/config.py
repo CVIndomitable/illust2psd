@@ -35,7 +35,7 @@ class PipelineConfig:
     max_image_size: int = 4096
 
     # Segmentation
-    segmentation_backend: str = "sam2"  # "sam2" | "heuristic"
+    segmentation_backend: str = "segformer"  # "segformer" | "sam2" | "heuristic"
     foreground_model: str = "isnet"  # "isnet" | "rembg" | "grabcut"
     sam2_checkpoint: str = "sam2_hiera_large"
     pose_backend: str = "mediapipe"  # "mediapipe" | "dwpose" | "heuristic"
