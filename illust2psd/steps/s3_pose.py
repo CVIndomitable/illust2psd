@@ -89,10 +89,16 @@ def estimate_pose(
     """
     if config.pose_backend == "mediapipe":
         try:
-            result = _mediapipe_pose(image, config)
-            if result and len(result.keypoints) > 5:
-                logger.info(f"Pose estimated with MediaPipe ({len(result.keypoints)} keypoints)")
-                return result
+            mp_result = _mediapipe_pose(image, config)
+            if mp_result and len(mp_result.keypoints) > 5:
+                # Merge: fill low-confidence keypoints with heuristic estimates
+                merged = _merge_with_heuristic(mp_result, fg_mask)
+                high_conf = sum(1 for kp in merged.keypoints.values() if kp.confidence >= 0.3)
+                logger.info(
+                    f"Pose estimated with MediaPipe ({len(mp_result.keypoints)} detected, "
+                    f"{high_conf} high-confidence after heuristic merge)"
+                )
+                return merged
             logger.warning("MediaPipe returned too few keypoints, using heuristic")
         except Exception as e:
             logger.warning(f"MediaPipe failed: {e}, using heuristic fallback")
@@ -156,6 +162,24 @@ def _mediapipe_pose(image: Image.Image, config: PipelineConfig) -> PoseResult | 
             )
 
     return PoseResult(keypoints=keypoints, method="mediapipe")
+
+
+def _merge_with_heuristic(mp_result: PoseResult, fg_mask: np.ndarray) -> PoseResult:
+    """Fill MediaPipe keypoints that have low confidence with heuristic estimates.
+
+    For anime characters, MediaPipe often detects body structure correctly but
+    gives low visibility scores. Keep detected keypoints when confidence >= 0.3;
+    substitute heuristic estimates for the rest.
+    """
+    heuristic = _heuristic_pose(fg_mask)
+    merged = dict(mp_result.keypoints)  # start from MediaPipe
+
+    for name, hkp in heuristic.keypoints.items():
+        existing = merged.get(name)
+        if existing is None or existing.confidence < 0.3:
+            merged[name] = hkp
+
+    return PoseResult(keypoints=merged, method="mediapipe+heuristic")
 
 
 def _heuristic_pose(fg_mask: np.ndarray) -> PoseResult:

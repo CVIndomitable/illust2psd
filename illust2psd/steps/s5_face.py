@@ -54,8 +54,8 @@ def extract_face_parts(
         logger.warning(f"Face mask bbox too small ({face_w}×{face_h}px), skipping face extraction")
         return masks
 
-    # Try SAM2 first if configured
-    if config.face_parser == "sam2" and config.segmentation_backend == "sam2":
+    # Try SAM2 first if configured (independent of main segmentation backend)
+    if config.face_parser == "sam2":
         try:
             masks = _sam2_face_parts(arr, face_mask, pose, config, h, w,
                                      fy_min, fy_max, fx_min, fx_max, face_h, face_w)

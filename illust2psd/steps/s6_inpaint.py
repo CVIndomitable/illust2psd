@@ -143,37 +143,16 @@ def _opencv_inpaint(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 
 def _ensure_lama_loaded(config: PipelineConfig) -> None:
-    """Load LaMa model if not already loaded."""
+    """Load LaMa model via simple-lama-inpainting."""
     global _lama_model, _lama_device
 
     if _lama_model is not None and _lama_device == config.device:
         return
 
-    import torch
-
-    from illust2psd.utils.download import get_model_path
-
-    device = config.device
-    if device == "mps" and not torch.backends.mps.is_available():
-        device = "cpu"
-
-    model_path = get_model_path("lama")
-    logger.info(f"Loading LaMa model on {device}...")
-
     try:
-        # Try loading as a full model checkpoint
-        checkpoint = torch.load(str(model_path), map_location=device, weights_only=False)
-
-        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-            # It's a training checkpoint with state_dict
-            logger.info("LaMa checkpoint loaded (state_dict format)")
-            _lama_model = checkpoint
-        elif isinstance(checkpoint, torch.nn.Module):
-            _lama_model = checkpoint
-        else:
-            # Raw state dict or other format
-            _lama_model = checkpoint
-
+        from simple_lama_inpainting import SimpleLama
+        logger.info("Loading LaMa model (simple-lama-inpainting)...")
+        _lama_model = SimpleLama()
         _lama_device = config.device
         logger.info("LaMa model loaded successfully")
     except Exception as e:
@@ -182,58 +161,16 @@ def _ensure_lama_loaded(config: PipelineConfig) -> None:
 
 
 def _lama_inpaint(rgb: np.ndarray, mask: np.ndarray, config: PipelineConfig) -> np.ndarray:
-    """LaMa inpainting via PyTorch."""
-    import torch
+    """LaMa inpainting via simple-lama-inpainting."""
+    from simple_lama_inpainting import SimpleLama
 
     global _lama_model
 
-    if _lama_model is None:
+    if _lama_model is None or not isinstance(_lama_model, SimpleLama):
         raise RuntimeError("LaMa model not loaded")
 
-    device = config.device
-    if device == "mps" and not torch.backends.mps.is_available():
-        device = "cpu"
+    img_pil = Image.fromarray(rgb)
+    mask_pil = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
 
-    h, w = rgb.shape[:2]
-
-    # Prepare input tensors
-    # LaMa expects: image (B, 3, H, W) in [0, 1], mask (B, 1, H, W) in {0, 1}
-    # Pad to multiple of 8 for the network
-    pad_h = (8 - h % 8) % 8
-    pad_w = (8 - w % 8) % 8
-
-    img_t = torch.from_numpy(rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-    mask_t = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-
-    if pad_h > 0 or pad_w > 0:
-        img_t = torch.nn.functional.pad(img_t, (0, pad_w, 0, pad_h), mode="reflect")
-        mask_t = torch.nn.functional.pad(mask_t, (0, pad_w, 0, pad_h), mode="constant", value=0)
-
-    img_t = img_t.to(device)
-    mask_t = mask_t.to(device)
-
-    try:
-        if isinstance(_lama_model, torch.nn.Module):
-            _lama_model.eval()
-            with torch.no_grad():
-                batch = {"image": img_t, "mask": mask_t}
-                result = _lama_model(batch)
-                if isinstance(result, dict):
-                    out_t = result.get("inpainted", result.get("predicted_image", img_t))
-                else:
-                    out_t = result
-        else:
-            # For state_dict-based models, fall back to OpenCV
-            raise RuntimeError("LaMa model format not directly runnable, using OpenCV")
-    except Exception:
-        raise
-
-    # Convert back
-    out = out_t[0].cpu().permute(1, 2, 0).numpy()
-    out = (np.clip(out, 0, 1) * 255).astype(np.uint8)
-
-    # Remove padding
-    if pad_h > 0 or pad_w > 0:
-        out = out[:h, :w]
-
-    return out
+    result_pil = _lama_model(img_pil, mask_pil)
+    return np.array(result_pil.convert("RGB"))
