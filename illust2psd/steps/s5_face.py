@@ -50,6 +50,10 @@ def extract_face_parts(
     face_h = fy_max - fy_min
     face_w = fx_max - fx_min
 
+    if face_h < 5 or face_w < 5:
+        logger.warning(f"Face mask bbox too small ({face_w}×{face_h}px), skipping face extraction")
+        return masks
+
     # Try SAM2 first if configured
     if config.face_parser == "sam2" and config.segmentation_backend == "sam2":
         try:
@@ -94,6 +98,13 @@ def _sam2_face_parts(
     crop_y2 = min(h, fy_max + pad)
     crop_x1 = max(0, fx_min - pad)
     crop_x2 = min(w, fx_max + pad)
+
+    if (crop_y2 - crop_y1) < 10 or (crop_x2 - crop_x1) < 10:
+        logger.warning(
+            f"Face crop too small ({crop_x2 - crop_x1}×{crop_y2 - crop_y1}px), "
+            "skipping SAM2 face extraction"
+        )
+        return {}
 
     face_crop = arr[crop_y1:crop_y2, crop_x1:crop_x2, :3]
     predictor.set_image(face_crop)

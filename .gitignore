@@ -14,3 +14,14 @@ build/
 *.pt
 *.task
 .DS_Store
+
+# Local test images and assets
+*.jpg
+*.jpeg
+素材/
+
+# Internal planning docs
+PLAN.md
+
+# Claude Code project files
+.claude/

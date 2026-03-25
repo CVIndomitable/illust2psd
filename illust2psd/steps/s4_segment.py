@@ -174,7 +174,10 @@ def _segformer_segment(
 
     # Add neck: narrow strip between face and body
     if "face_base" in raw_masks and "body" in raw_masks:
-        _add_neck(raw_masks, h, w)
+        _add_neck(raw_masks, fg_mask, h, w)
+
+    # Recover hair-colored pixels misclassified as body (long hair problem)
+    _recover_hair_from_body(raw_masks, image, fg_mask)
 
     # Assign uncovered foreground pixels intelligently
     _assign_uncovered_smart(raw_masks, fg_mask, h, w)
@@ -564,8 +567,97 @@ def _assign_uncovered_smart(
     )
 
 
-def _add_neck(masks: dict[str, np.ndarray], h: int, w: int) -> None:
-    """Create neck region between face bottom and body top."""
+def _recover_hair_from_body(
+    masks: dict[str, np.ndarray],
+    image: Image.Image,
+    fg_mask: np.ndarray,
+) -> None:
+    """Recover hair-colored pixels that SegFormer misclassified as body.
+
+    Long hair flowing behind/beside the body is often labeled 'upper-clothes'
+    by ATR-trained SegFormer.  This function:
+    1. Builds a hair color model (mean/std in LAB) from detected hair pixels.
+    2. Finds body pixels whose color matches the hair model.
+    3. Keeps only candidates that are spatially near existing hair OR in the
+       lateral / below-body region (where body-colored long hair actually lives).
+    4. Reclassifies them as back_hair.
+    """
+    if "body" not in masks:
+        return
+
+    hair_mask = np.zeros_like(masks["body"])
+    for pid in ("back_hair", "front_hair"):
+        if pid in masks:
+            hair_mask |= masks[pid]
+
+    if not np.any(hair_mask):
+        return
+
+    img_rgb = np.array(image.convert("RGB"))
+    img_lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    hair_pixels_lab = img_lab[hair_mask]
+    hair_mean = hair_pixels_lab.mean(axis=0)  # L, A, B
+    hair_std = hair_pixels_lab.std(axis=0)
+
+    # Tolerance: 2 sigma with floor so sparse hair still matches
+    tol = np.maximum(hair_std * 2.0, np.array([18.0, 10.0, 10.0]))
+
+    diff = np.abs(img_lab - hair_mean)  # (H, W, 3)
+    color_match = np.all(diff < tol, axis=2)
+
+    body = masks["body"]
+    candidate = body & color_match
+
+    if not np.any(candidate):
+        return
+
+    h, w = body.shape
+
+    # Spatial constraint 1: pixels adjacent to existing hair (dilated 50 px)
+    dil_px = min(50, max(h, w) // 12)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_px * 2 + 1, dil_px * 2 + 1))
+    hair_dilated = cv2.dilate(hair_mask.astype(np.uint8), kernel) > 0
+
+    # Spatial constraint 2: lateral edges or below-body region
+    body_cols = np.where(np.any(body, axis=0))[0]
+    body_rows = np.where(np.any(body, axis=1))[0]
+    lateral_or_below = np.zeros((h, w), dtype=bool)
+    if len(body_cols) > 0:
+        body_cx = (body_cols[0] + body_cols[-1]) / 2
+        body_bw = body_cols[-1] - body_cols[0]
+        # Outer 30% on each side = lateral hair strips
+        lateral_or_below[:, : int(body_cx - body_bw * 0.35)] = True
+        lateral_or_below[:, int(body_cx + body_bw * 0.35) :] = True
+    if len(body_rows) > 0:
+        below_start = body_rows[int(len(body_rows) * 0.80)]
+        lateral_or_below[below_start:, :] = True
+
+    to_reclassify = candidate & (hair_dilated | lateral_or_below)
+
+    count = int(np.sum(to_reclassify))
+    if count < 50:
+        return
+
+    masks["body"] = body & ~to_reclassify
+
+    if "back_hair" in masks:
+        masks["back_hair"] |= to_reclassify
+    else:
+        masks["back_hair"] = to_reclassify
+
+    logger.debug(f"Hair recovery: moved {count} body px → back_hair (hair color ±{tol.astype(int).tolist()})")
+
+
+def _add_neck(masks: dict[str, np.ndarray], fg_mask: np.ndarray, h: int, w: int) -> None:
+    """Create neck region between face bottom and body top.
+
+    The neck is carved from the foreground (primarily from body) in the
+    vertical strip just below the face.  Using 1/3 of face width (previously
+    1/4 was too narrow for anime characters).  Pixels are taken from the body
+    mask rather than from unclaimed gaps, so the neck always has content even
+    when face and body are directly adjacent.
+    """
     face = masks["face_base"]
     body = masks["body"]
 
@@ -575,37 +667,33 @@ def _add_neck(masks: dict[str, np.ndarray], h: int, w: int) -> None:
     if len(face_rows) == 0 or len(body_rows) == 0:
         return
 
-    face_bottom = face_rows[-1]
-    body_top = body_rows[0]
+    face_bottom = int(face_rows[-1])
+    body_top = int(body_rows[0])
 
-    if body_top <= face_bottom:
-        # Face and body overlap — neck is the thin gap
-        gap = max(3, int((face_bottom - body_top) * 0.3))
-        neck_y_start = face_bottom - gap
-        neck_y_end = face_bottom + gap
-    else:
-        # There's a gap between face and body
-        neck_y_start = face_bottom
-        neck_y_end = body_top
+    # Neck vertical extent: from face bottom into body top
+    neck_y_start = max(0, face_bottom - 2)           # tiny overlap with face bottom
+    neck_y_end = min(h, max(body_top + 8, face_bottom + 15))  # always at least 15px tall
 
-    # Neck width: narrower than face
+    # Neck horizontal extent: 1/3 of face width, centered on face
     face_cols = np.where(np.any(face, axis=0))[0]
     if len(face_cols) == 0:
         return
-    face_cx = (face_cols[0] + face_cols[-1]) // 2
-    face_w = face_cols[-1] - face_cols[0]
-    neck_half_w = max(5, face_w // 4)
+    face_cx = (int(face_cols[0]) + int(face_cols[-1])) // 2
+    face_w = int(face_cols[-1]) - int(face_cols[0])
+    neck_half_w = max(8, face_w // 3)
 
-    neck = np.zeros((h, w), dtype=bool)
-    y1 = max(0, neck_y_start)
-    y2 = min(h, neck_y_end)
-    x1 = max(0, face_cx - neck_half_w)
-    x2 = min(w, face_cx + neck_half_w)
-    neck[y1:y2, x1:x2] = True
+    neck_region = np.zeros((h, w), dtype=bool)
+    neck_region[neck_y_start:neck_y_end, max(0, face_cx - neck_half_w):min(w, face_cx + neck_half_w)] = True
 
-    # Only keep neck pixels that are in the foreground and not in face/body
-    fg_here = face | body
-    neck &= ~face & ~body
+    # Take all foreground pixels in the neck region that belong to body or are unclaimed
+    neck = neck_region & fg_mask & ~face
+    if not np.any(neck):
+        return
+
+    # Carve neck from body (body loses these pixels)
+    body_carved = neck & body
+    if np.any(body_carved):
+        masks["body"] = body & ~body_carved
 
     if np.sum(neck) > 20:
         masks["neck"] = neck
@@ -828,8 +916,12 @@ def _assign_uncovered(masks: dict[str, np.ndarray], uncovered: np.ndarray) -> No
     for i, pid in enumerate(part_ids, 1):
         label_map[masks[pid]] = i
 
-    dist, indices = ndi.distance_transform_edt(label_map == 0, return_indices=True)
+    _, indices = ndi.distance_transform_edt(label_map == 0, return_indices=True)
+
+    # Build full (H,W) nearest-label map using fancy indexing on (H,W) index arrays.
+    # The old code did indices[0][uncovered] which produces a (N,) 1D array, then
+    # tried to AND it with the (H,W) uncovered mask — shape mismatch.
+    nearest_label_map = label_map[indices[0], indices[1]]  # (H,W)
 
     for i, pid in enumerate(part_ids, 1):
-        nearest_label = label_map[indices[0][uncovered], indices[1][uncovered]]
-        masks[pid] |= uncovered & (nearest_label == i)
+        masks[pid] |= uncovered & (nearest_label_map == i)
