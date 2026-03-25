@@ -120,13 +120,30 @@ def validate_quality(
     Returns:
         QualityMetrics with PSNR, SSIM, coverage
     """
-    w, h = canvas_size
+    # Derive canvas dimensions unambiguously.
+    # fg_mask is always numpy (H, W), so use it as the authoritative source when
+    # available. Fall back to canvas_size which is PIL (width, height) format.
+    if fg_mask is not None:
+        canvas_h, canvas_w = fg_mask.shape[:2]
+    else:
+        canvas_w, canvas_h = canvas_size  # PIL (W, H) → explicit names
 
     total_opaque = sum(int(np.sum(l.image[:, :, 3] > 0)) for l in layers)
 
     # Reconstruct composite from layers
     layer_data = [(l.image, l.offset_x, l.offset_y) for l in layers]
-    composite = composite_layers(layer_data, w, h)
+    composite = composite_layers(layer_data, canvas_w, canvas_h)
+
+    # Sanity check: composite and fg_mask must have the same spatial dimensions
+    if fg_mask is not None and composite.shape[:2] != fg_mask.shape[:2]:
+        logger.warning(
+            f"Shape mismatch: composite {composite.shape[:2]} vs fg_mask {fg_mask.shape[:2]} — "
+            "skipping coverage and PSNR calculation"
+        )
+        return QualityMetrics(
+            psnr=0.0, ssim=0.0, coverage=1.0,
+            layer_count=len(layers), total_opaque_pixels=total_opaque,
+        )
 
     # Coverage
     coverage = 1.0
