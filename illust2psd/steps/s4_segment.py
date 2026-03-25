@@ -670,9 +670,11 @@ def _add_neck(masks: dict[str, np.ndarray], fg_mask: np.ndarray, h: int, w: int)
     face_bottom = int(face_rows[-1])
     body_top = int(body_rows[0])
 
-    # Neck vertical extent: from face bottom into body top
+    # Neck vertical extent: from face bottom, at least face_h * 0.10 (min 40px)
+    face_h_px = face_rows[-1] - face_rows[0]
+    min_neck_h = max(40, int(face_h_px * 0.10))
     neck_y_start = max(0, face_bottom - 2)           # tiny overlap with face bottom
-    neck_y_end = min(h, max(body_top + 8, face_bottom + 15))  # always at least 15px tall
+    neck_y_end = min(h, face_bottom + min_neck_h)
 
     # Neck horizontal extent: 1/3 of face width, centered on face
     face_cols = np.where(np.any(face, axis=0))[0]

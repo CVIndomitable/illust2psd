@@ -60,6 +60,24 @@ def extract_face_parts(
             masks = _sam2_face_parts(arr, face_mask, pose, config, h, w,
                                      fy_min, fy_max, fx_min, fx_max, face_h, face_w)
             if masks:
+                # Patch: if any eye mask is suspiciously small (<0.5% of face area),
+                # replace it with the heuristic estimate
+                face_area = face_h * face_w
+                min_eye_px = max(50, int(face_area * 0.005))
+                heuristic = None
+                for eye_id in ("left_eye", "right_eye"):
+                    if eye_id in masks and np.sum(masks[eye_id]) < min_eye_px:
+                        logger.debug(
+                            f"SAM2 {eye_id} too small ({np.sum(masks[eye_id])} px < {min_eye_px}), "
+                            "using heuristic"
+                        )
+                        if heuristic is None:
+                            heuristic = _heuristic_face_parts(
+                                arr, face_mask, pose, h, w,
+                                fy_min, fy_max, fx_min, fx_max, face_h, face_w, config,
+                            )
+                        if eye_id in heuristic:
+                            masks[eye_id] = heuristic[eye_id]
                 logger.info(f"Extracted {len(masks)} face parts with SAM2")
                 return masks
         except Exception as e:
@@ -185,14 +203,14 @@ def _build_face_prompts(
         prompts["left_eye"] = {
             "positive": [to_crop(l_eye.x, l_eye.y)],
             "negative": neg,
-            "max_ratio": 0.12,
+            "max_ratio": 0.18,
         }
     if r_eye:
         neg = [to_crop(nose_kp.x, nose_kp.y)] if nose_kp else []
         prompts["right_eye"] = {
             "positive": [to_crop(r_eye.x, r_eye.y)],
             "negative": neg,
-            "max_ratio": 0.12,
+            "max_ratio": 0.18,
         }
 
     # Eyebrows — slightly above eyes
