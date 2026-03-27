@@ -169,7 +169,7 @@ def _segformer_segment(
         _split_hair(raw_masks, fg_mask, pose, h, w)
 
     # Extract arms and legs from body using keypoints
-    _extract_arms(raw_masks, fg_mask, pose, h, w)
+    _extract_arms(raw_masks, fg_mask, pose, h, w, image=image)
     _extract_legs(raw_masks, fg_mask, pose, h, w)
 
     # Add neck: narrow strip between face and body
@@ -228,11 +228,33 @@ def _split_hair(
         masks["back_hair"] = back_hair
 
 
+def _is_skin_colored(img_rgb: np.ndarray, mask: np.ndarray, min_ratio: float = 0.15) -> bool:
+    """Check if a masked region contains enough skin-colored pixels.
+
+    Uses a broad anime skin detection in YCrCb space that covers
+    light/medium/dark skin tones common in anime art.
+    Returns True if at least min_ratio of the masked pixels are skin-colored.
+    """
+    if not np.any(mask):
+        return False
+    ycrcb = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2YCrCb)
+    pixels = ycrcb[mask]
+    # Anime skin: Y > 100 (not too dark), Cr in [130..180], Cb in [70..135]
+    skin = (
+        (pixels[:, 0] > 100)
+        & (pixels[:, 1] >= 130) & (pixels[:, 1] <= 180)
+        & (pixels[:, 2] >= 70) & (pixels[:, 2] <= 135)
+    )
+    ratio = np.sum(skin) / len(pixels)
+    return ratio >= min_ratio
+
+
 def _extract_arms(
     masks: dict[str, np.ndarray],
     fg_mask: np.ndarray,
     pose: PoseResult,
     h: int, w: int,
+    image: Image.Image | None = None,
 ) -> None:
     """Extract arm regions from body mask using pose keypoints.
 
@@ -243,13 +265,16 @@ def _extract_arms(
     Strategy for each arm:
     1. If SegFormer already detected it (skin visible), keep it.
     2. Otherwise, draw a thick corridor from shoulder→elbow→wrist.
-    3. Intersect with (body | foreground) to get actual arm pixels.
-    4. Subtract from body mask.
-    5. Split into arm_back (shoulder→elbow) and arm_front (elbow→wrist).
+    3. Intersect with body mask to get candidate arm pixels.
+    4. Validate: candidate must contain skin-colored pixels (rejects weapons).
+    5. Subtract from body mask.
+    6. Split into arm_back (shoulder→elbow) and arm_front (elbow→wrist).
     """
     body = masks.get("body")
     if body is None:
         return
+
+    img_rgb = np.array(image.convert("RGB")) if image is not None else None
 
     # Get body bounding box for width reference
     body_cols = np.where(np.any(body, axis=0))[0]
@@ -273,11 +298,6 @@ def _extract_arms(
         if not shoulder:
             continue
 
-        # Determine if arm is on the outer side of body
-        # (helps decide corridor width and direction)
-        arm_is_outer = (side == "left" and shoulder.x < body_cx) or \
-                       (side == "right" and shoulder.x > body_cx)
-
         # Corridor width: proportional to body width
         corridor_w = max(10, int(body_w * 0.12))
 
@@ -285,17 +305,12 @@ def _extract_arms(
         arm_mask = np.zeros((h, w), dtype=np.uint8)
 
         if elbow:
-            # Shoulder to elbow
             _draw_thick_line(arm_mask, shoulder, elbow, corridor_w)
             if wrist:
-                # Elbow to wrist
                 _draw_thick_line(arm_mask, elbow, wrist, int(corridor_w * 0.85))
         elif wrist:
-            # Direct shoulder to wrist
             _draw_thick_line(arm_mask, shoulder, wrist, corridor_w)
         else:
-            # Only shoulder known — extend outward and downward
-            # Estimate elbow at 60% body height from shoulder
             body_rows = np.where(np.any(body, axis=1))[0]
             if len(body_rows) == 0:
                 continue
@@ -306,15 +321,12 @@ def _extract_arms(
             _draw_thick_line(arm_mask, shoulder, est_elbow, corridor_w)
 
         arm_bool = arm_mask > 0
-
-        # Only carve from body mask — don't grab unclaimed pixels (weapons, accessories)
         arm_bool &= body
 
         # Don't let arm eat too much of the body (max 30% of body pixels)
         arm_px = np.sum(arm_bool)
         body_px = np.sum(body)
         if arm_px > body_px * 0.30:
-            # Too much — reduce corridor width and retry
             arm_mask2 = np.zeros((h, w), dtype=np.uint8)
             narrow_w = max(8, corridor_w // 2)
             if elbow:
@@ -326,10 +338,15 @@ def _extract_arms(
         if np.sum(arm_bool) < 50:
             continue
 
+        # Skin color validation: reject corridors that are all weapon/metal
+        if img_rgb is not None and not _is_skin_colored(img_rgb, arm_bool):
+            logger.debug(f"Skipped {side} arm extraction: no skin pixels (likely weapon/rigging)")
+            continue
+
         # Split into back (shoulder→elbow) and front (elbow→wrist)
         if elbow:
             upper_mask = np.zeros((h, w), dtype=np.uint8)
-            _draw_thick_line(upper_mask, shoulder, elbow, corridor_w + 4)  # slightly wider to capture
+            _draw_thick_line(upper_mask, shoulder, elbow, corridor_w + 4)
             upper_region = upper_mask > 0
 
             arm_back = arm_bool & upper_region
@@ -340,13 +357,11 @@ def _extract_arms(
             if np.sum(arm_front) > 30:
                 masks[part_front] = arm_front
 
-            # If one part is empty, put everything in front
             if np.sum(arm_front) <= 30 and np.sum(arm_back) > 30:
                 masks[part_front] = arm_bool
                 if part_back in masks:
                     del masks[part_back]
         else:
-            # No elbow — all goes to arm_front
             masks[part_front] = arm_bool
 
         # Subtract extracted arm from body
@@ -477,13 +492,13 @@ def _assign_uncovered_smart(
     fg_mask: np.ndarray,
     h: int, w: int,
 ) -> None:
-    """Assign uncovered foreground pixels to the nearest existing part,
-    with spatial constraints to prevent hair from absorbing body-area junk.
+    """Assign uncovered foreground pixels intelligently.
 
-    Rules:
-    - Pixels in the head region (top 25%) can go to any part
-    - Pixels below the head region cannot go to hair parts
-    - Remaining unassigned pixels go to body (clothes/accessories)
+    Strategy:
+    - Pixels CLOSE to a classified region (within margin) → nearest part
+      (with hair/head spatial constraints as before)
+    - Pixels FAR from any classified region → accessory
+      (these are likely weapons, rigging, props, or other non-human elements)
     """
     from scipy import ndimage as ndi
 
@@ -495,75 +510,85 @@ def _assign_uncovered_smart(
         return
 
     if not masks:
-        masks["body"] = uncovered
+        masks["accessory"] = uncovered
         return
 
-    # Find head boundary: use face position (not hair, which can flow far down)
-    head_bottom = h * 0.25  # default: top 25%
-    for pid in ["face_base", "front_hair"]:  # NOT back_hair — it flows too far
-        if pid in masks and np.any(masks[pid]):
-            rows = np.where(np.any(masks[pid], axis=1))[0]
-            if len(rows) > 0:
-                head_bottom = max(head_bottom, rows[-1] + h * 0.05)
-    # Cap head region at 40% of image max (even with high face)
-    head_bottom = min(head_bottom, h * 0.40)
+    # Compute distance from any classified region
+    dist_from_classified = ndi.distance_transform_edt(~covered)
 
-    head_region = np.zeros((h, w), dtype=bool)
-    head_region[:int(min(head_bottom, h * 0.45)), :] = True
+    # Margin: pixels within this distance get nearest-neighbor assignment.
+    # Beyond this → accessory. Use ~3% of image diagonal as margin.
+    diag = (h ** 2 + w ** 2) ** 0.5
+    margin_px = max(20, int(diag * 0.03))
 
-    hair_parts = {"front_hair", "back_hair"}
+    near_uncovered = uncovered & (dist_from_classified <= margin_px)
+    far_uncovered = uncovered & (dist_from_classified > margin_px)
 
-    # Build label maps as full (h,w) arrays for correct broadcasting
-    label_map_full = np.zeros((h, w), dtype=np.int32)
-    label_map_no_hair = np.zeros((h, w), dtype=np.int32)
-    part_ids = list(masks.keys())
+    # --- Near uncovered: assign to nearest part (with head/hair constraints) ---
+    if np.any(near_uncovered):
+        # Find head boundary
+        head_bottom = h * 0.25
+        for pid in ["face_base", "front_hair"]:
+            if pid in masks and np.any(masks[pid]):
+                rows = np.where(np.any(masks[pid], axis=1))[0]
+                if len(rows) > 0:
+                    head_bottom = max(head_bottom, rows[-1] + h * 0.05)
+        head_bottom = min(head_bottom, h * 0.40)
 
-    for i, pid in enumerate(part_ids, 1):
-        label_map_full[masks[pid]] = i
-        if pid not in hair_parts:
-            label_map_no_hair[masks[pid]] = i
+        head_region = np.zeros((h, w), dtype=bool)
+        head_region[:int(head_bottom), :] = True
 
-    # Pre-compute nearest-label maps (full h,w) for correct pixel assignment
-    # Map 1: nearest label from ALL parts (for head region)
-    nearest_full = np.zeros((h, w), dtype=np.int32)
-    unlabeled_full = label_map_full == 0
-    if np.any(~unlabeled_full):
-        _, idx_full = ndi.distance_transform_edt(unlabeled_full, return_indices=True)
-        nearest_full = label_map_full[idx_full[0], idx_full[1]]
+        hair_parts = {"front_hair", "back_hair"}
 
-    # Map 2: nearest label from NON-HAIR parts only (for body region)
-    nearest_no_hair = np.zeros((h, w), dtype=np.int32)
-    unlabeled_nh = label_map_no_hair == 0
-    if np.any(~unlabeled_nh):
-        _, idx_nh = ndi.distance_transform_edt(unlabeled_nh, return_indices=True)
-        nearest_no_hair = label_map_no_hair[idx_nh[0], idx_nh[1]]
+        label_map_full = np.zeros((h, w), dtype=np.int32)
+        label_map_no_hair = np.zeros((h, w), dtype=np.int32)
+        part_ids = list(masks.keys())
 
-    # Head-region uncovered pixels → assign to nearest ANY part
-    uncov_head = uncovered & head_region
-    # Body-region uncovered pixels → assign to nearest NON-HAIR part
-    uncov_body = uncovered & ~head_region
+        for i, pid in enumerate(part_ids, 1):
+            label_map_full[masks[pid]] = i
+            if pid not in hair_parts:
+                label_map_no_hair[masks[pid]] = i
 
-    for i, pid in enumerate(part_ids, 1):
-        # Head region: any part
-        head_px = uncov_head & (nearest_full == i)
-        if np.any(head_px):
-            masks[pid] |= head_px
+        nearest_full = np.zeros((h, w), dtype=np.int32)
+        unlabeled_full = label_map_full == 0
+        if np.any(~unlabeled_full):
+            _, idx_full = ndi.distance_transform_edt(unlabeled_full, return_indices=True)
+            nearest_full = label_map_full[idx_full[0], idx_full[1]]
 
-        # Body region: non-hair parts only
-        if pid not in hair_parts:
-            body_px = uncov_body & (nearest_no_hair == i)
-            if np.any(body_px):
-                masks[pid] |= body_px
+        nearest_no_hair = np.zeros((h, w), dtype=np.int32)
+        unlabeled_nh = label_map_no_hair == 0
+        if np.any(~unlabeled_nh):
+            _, idx_nh = ndi.distance_transform_edt(unlabeled_nh, return_indices=True)
+            nearest_no_hair = label_map_no_hair[idx_nh[0], idx_nh[1]]
 
-    # Any still uncovered goes to body
+        near_head = near_uncovered & head_region
+        near_body = near_uncovered & ~head_region
+
+        for i, pid in enumerate(part_ids, 1):
+            head_px = near_head & (nearest_full == i)
+            if np.any(head_px):
+                masks[pid] |= head_px
+
+            if pid not in hair_parts:
+                body_px = near_body & (nearest_no_hair == i)
+                if np.any(body_px):
+                    masks[pid] |= body_px
+
+    # --- Far uncovered: all goes to accessory (weapons, rigging, props) ---
+    # Also collect any still-unassigned near pixels (e.g. body-region hair-only area)
     still_uncovered = fg_mask & ~_union_masks(masks)
-    if np.any(still_uncovered):
-        masks.setdefault("body", np.zeros((h, w), dtype=bool))
-        masks["body"] |= still_uncovered
+    far_total = far_uncovered | (still_uncovered & ~far_uncovered)
+    far_total = fg_mask & ~_union_masks(masks)  # recompute to be precise
 
+    if np.any(far_total):
+        masks.setdefault("accessory", np.zeros((h, w), dtype=bool))
+        masks["accessory"] |= far_total
+
+    near_count = int(np.sum(near_uncovered))
+    far_count = int(np.sum(far_uncovered))
     logger.debug(
-        f"Assigned {uncovered_count} uncovered px "
-        f"(head→any: {int(np.sum(uncov_head))}, body→non-hair: {int(np.sum(uncov_body))})"
+        f"Uncovered: {uncovered_count} px total — "
+        f"{near_count} near (→nearest part), {far_count} far (→accessory)"
     )
 
 
@@ -600,8 +625,10 @@ def _recover_hair_from_body(
     hair_mean = hair_pixels_lab.mean(axis=0)  # L, A, B
     hair_std = hair_pixels_lab.std(axis=0)
 
-    # Tolerance: 2 sigma with floor so sparse hair still matches
-    tol = np.maximum(hair_std * 2.0, np.array([18.0, 10.0, 10.0]))
+    # Tolerance: 2 sigma with floor AND ceiling.
+    # Without a cap, high-variance hair (e.g. light blue with highlights)
+    # produces L tolerance >100, matching metallic weapons and everything else.
+    tol = np.clip(hair_std * 2.0, a_min=[18.0, 10.0, 10.0], a_max=[50.0, 25.0, 25.0])
 
     diff = np.abs(img_lab - hair_mean)  # (H, W, 3)
     color_match = np.all(diff < tol, axis=2)
@@ -614,26 +641,24 @@ def _recover_hair_from_body(
 
     h, w = body.shape
 
-    # Spatial constraint 1: pixels adjacent to existing hair (dilated 50 px)
-    dil_px = min(50, max(h, w) // 12)
+    # Spatial constraint: ONLY pixels adjacent to existing hair (no lateral/below).
+    # The old lateral_or_below heuristic was too loose and captured weapon/rigging
+    # that happened to sit at the sides of the body.
+    dil_px = min(30, max(h, w) // 20)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_px * 2 + 1, dil_px * 2 + 1))
     hair_dilated = cv2.dilate(hair_mask.astype(np.uint8), kernel) > 0
 
-    # Spatial constraint 2: lateral edges or below-body region
-    body_cols = np.where(np.any(body, axis=0))[0]
-    body_rows = np.where(np.any(body, axis=1))[0]
-    lateral_or_below = np.zeros((h, w), dtype=bool)
-    if len(body_cols) > 0:
-        body_cx = (body_cols[0] + body_cols[-1]) / 2
-        body_bw = body_cols[-1] - body_cols[0]
-        # Outer 30% on each side = lateral hair strips
-        lateral_or_below[:, : int(body_cx - body_bw * 0.35)] = True
-        lateral_or_below[:, int(body_cx + body_bw * 0.35) :] = True
-    if len(body_rows) > 0:
-        below_start = body_rows[int(len(body_rows) * 0.80)]
-        lateral_or_below[below_start:, :] = True
+    # Require connected components: only keep candidates that form clusters
+    # (isolated small fragments are likely mismatches)
+    candidate_connected = candidate & hair_dilated
+    if not np.any(candidate_connected):
+        return
 
-    to_reclassify = candidate & (hair_dilated | lateral_or_below)
+    # Remove small fragments (< 200 px) to avoid weapon debris
+    candidate_connected = remove_small_components(candidate_connected, min_pixels=200)
+
+    # Only use adjacency-based candidates (no lateral/below heuristic)
+    to_reclassify = candidate_connected
 
     count = int(np.sum(to_reclassify))
     if count < 50:
