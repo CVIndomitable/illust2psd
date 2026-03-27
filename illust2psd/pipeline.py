@@ -61,6 +61,35 @@ def run_pipeline(
     logger.info("Step 4/8: Semantic segmentation")
     seg: SegmentResult = segment(prep.image, fg.mask, pose, config)
 
+    # S4.5: Reclaim face-region accessory pixels back to face_base.
+    # SegFormer's "sunglasses" class (ATR 3) captures glasses + eyes as accessory,
+    # preventing S5 from finding them. Move those pixels back to face_base.
+    if "accessory" in seg.masks and "face_base" in seg.masks:
+        face_base = seg.masks["face_base"]
+        acc = seg.masks["accessory"]
+        # Expand face region slightly to catch glasses that extend beyond face skin
+        face_rows = np.where(np.any(face_base, axis=1))[0]
+        face_cols = np.where(np.any(face_base, axis=0))[0]
+        if len(face_rows) > 0 and len(face_cols) > 0:
+            fh = face_rows[-1] - face_rows[0]
+            fw = face_cols[-1] - face_cols[0]
+            pad = int(max(fh, fw) * 0.3)
+            y1, y2 = max(0, face_rows[0] - pad), min(face_base.shape[0], face_rows[-1] + pad)
+            x1, x2 = max(0, face_cols[0] - pad), min(face_base.shape[1], face_cols[-1] + pad)
+            face_region = np.zeros_like(face_base)
+            face_region[y1:y2, x1:x2] = True
+            reclaim = acc & face_region
+            if np.any(reclaim):
+                seg.masks["face_base"] = face_base | reclaim
+                seg.masks["accessory"] = acc & ~reclaim
+                seg.full_masks["face_base"] = seg.full_masks.get("face_base", face_base) | reclaim
+                logger.debug(f"Reclaimed {int(np.sum(reclaim))} accessory px in face region → face_base")
+                # Remove accessory if empty
+                if not np.any(seg.masks["accessory"]):
+                    del seg.masks["accessory"]
+                    if "accessory" in seg.full_masks:
+                        del seg.full_masks["accessory"]
+
     # S5: Face part extraction
     logger.info("Step 5/8: Face part extraction")
     face_mask = seg.masks.get("face_base")
