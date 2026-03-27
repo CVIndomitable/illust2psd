@@ -23,6 +23,8 @@ class ModelManager:
         self._isnet_device = None
         self._segformer_processor = None
         self._segformer_model = None
+        self._gdino_processor = None
+        self._gdino_model = None
 
     @classmethod
     def get(cls) -> ModelManager:
@@ -112,6 +114,36 @@ class ModelManager:
         logger.info("SegFormer ready (ATR 18-class)")
         return self._segformer_processor, self._segformer_model
 
+    def get_grounding_dino(self) -> tuple:
+        """Get or create Grounding DINO model for open-vocab object detection.
+
+        Uses IDEA-Research/grounding-dino-tiny (~250MB).
+        Returns (processor, model).
+        """
+        if self._gdino_processor is not None:
+            return self._gdino_processor, self._gdino_model
+
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+        model_id = "IDEA-Research/grounding-dino-tiny"
+        logger.info(f"Loading Grounding DINO ({model_id})...")
+
+        import socket
+        try:
+            sock = socket.create_connection(("127.0.0.1", 7897), timeout=1)
+            sock.close()
+            os.environ.setdefault("HTTPS_PROXY", "http://127.0.0.1:7897")
+            os.environ.setdefault("HTTP_PROXY", "http://127.0.0.1:7897")
+        except (ConnectionRefusedError, OSError, socket.timeout):
+            pass
+
+        self._gdino_processor = AutoProcessor.from_pretrained(model_id)
+        self._gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id)
+        self._gdino_model.eval()
+
+        logger.info("Grounding DINO ready")
+        return self._gdino_processor, self._gdino_model
+
     def clear(self) -> None:
         """Release all loaded models."""
         self._sam2_predictor = None
@@ -120,4 +152,6 @@ class ModelManager:
         self._isnet_device = None
         self._segformer_processor = None
         self._segformer_model = None
+        self._gdino_processor = None
+        self._gdino_model = None
         logger.info("All models released")

@@ -176,6 +176,9 @@ def _segformer_segment(
     if "face_base" in raw_masks and "body" in raw_masks:
         _add_neck(raw_masks, fg_mask, h, w)
 
+    # Detect weapons/props with Grounding DINO and move from body to accessory
+    _detect_weapons_gdino(raw_masks, image, fg_mask, h, w)
+
     # Recover hair-colored pixels misclassified as body (long hair problem)
     _recover_hair_from_body(raw_masks, image, fg_mask)
 
@@ -183,6 +186,113 @@ def _segformer_segment(
     _assign_uncovered_smart(raw_masks, fg_mask, h, w)
 
     return raw_masks
+
+
+def _detect_weapons_gdino(
+    masks: dict[str, np.ndarray],
+    image: Image.Image,
+    fg_mask: np.ndarray,
+    h: int, w: int,
+) -> None:
+    """Use Grounding DINO to detect weapons/props and move them from body to accessory.
+
+    SegFormer ATR classifies weapons overlapping clothing as "upper-clothes" (body).
+    This step uses open-vocabulary detection to find weapon regions and reclassify them.
+    """
+    body = masks.get("body")
+    if body is None or np.sum(body) < 500:
+        return
+
+    try:
+        import torch
+        from illust2psd.models.model_manager import ModelManager
+
+        processor, model = ModelManager.get().get_grounding_dino()
+
+        rgb = image.convert("RGB")
+
+        # Prompt for common non-human elements in game character art.
+        # Avoid ambiguous words: "bow" matches ribbons/ties, "staff" matches full body.
+        text = "weapon. sword. gun. cannon. shield. lance. spear. axe. rifle. battleship turret. mechanical equipment."
+
+        inputs = processor(images=rgb, text=text, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=0.40,
+            text_threshold=0.40,
+            target_sizes=[(h, w)],
+        )[0]
+
+        boxes = results["boxes"]  # (N, 4) in xyxy format
+        scores = results["scores"]
+        labels = results["labels"]
+
+        if len(boxes) == 0:
+            logger.debug("Grounding DINO: no weapons detected")
+            return
+
+        # Build weapon region mask from detected bounding boxes
+        # Filter: reject boxes that are too large (>20% of foreground area = false positive)
+        fg_area = int(np.sum(fg_mask))
+        body_area = int(np.sum(body))
+        max_box_area = fg_area * 0.20
+
+        weapon_mask = np.zeros((h, w), dtype=bool)
+        for i, (box, score, label) in enumerate(zip(boxes, scores, labels)):
+            x1, y1, x2, y2 = box.int().tolist()
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            box_area = (x2 - x1) * (y2 - y1)
+            if box_area > max_box_area:
+                logger.debug(f"Grounding DINO: '{label}' score={score:.2f} box=({x1},{y1},{x2},{y2}) — SKIPPED (too large: {box_area} > {int(max_box_area)})")
+                continue
+            weapon_mask[y1:y2, x1:x2] = True
+            logger.debug(f"Grounding DINO: '{label}' score={score:.2f} box=({x1},{y1},{x2},{y2})")
+
+        # Only move body pixels that are in weapon regions AND not skin-colored
+        img_rgb = np.array(rgb)
+        weapon_body = weapon_mask & body
+        if not np.any(weapon_body):
+            return
+
+        # Filter: keep only non-skin pixels (weapons are metallic, not skin)
+        skin_in_weapon = _is_skin_colored(img_rgb, weapon_body, min_ratio=0.0)
+        # If > 40% of weapon-body pixels are skin, it's probably a false positive
+        # (detected the character's body as a weapon)
+        if np.any(weapon_body):
+            ycrcb = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2YCrCb)
+            pixels = ycrcb[weapon_body]
+            skin = (
+                (pixels[:, 0] > 100)
+                & (pixels[:, 1] >= 130) & (pixels[:, 1] <= 180)
+                & (pixels[:, 2] >= 70) & (pixels[:, 2] <= 135)
+            )
+            skin_ratio = np.sum(skin) / len(pixels)
+            if skin_ratio > 0.40:
+                logger.debug(f"Grounding DINO: weapon region is {skin_ratio:.0%} skin, skipping (false positive)")
+                return
+
+        # Safety: don't move more than 50% of body (would destroy the layer)
+        to_move = weapon_body
+        count = int(np.sum(to_move))
+        if count < 100:
+            return
+        if count > body_area * 0.50:
+            logger.debug(f"Grounding DINO: would move {count}/{body_area} body px ({count/body_area:.0%}), capping to preserve body")
+            return
+
+        masks["body"] = body & ~to_move
+        masks.setdefault("accessory", np.zeros((h, w), dtype=bool))
+        masks["accessory"] |= to_move
+
+        logger.debug(f"Grounding DINO: moved {count} body px → accessory (weapon regions)")
+
+    except Exception as e:
+        logger.warning(f"Grounding DINO weapon detection failed: {e}, skipping")
 
 
 def _split_hair(
