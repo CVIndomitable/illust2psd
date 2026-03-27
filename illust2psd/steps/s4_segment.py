@@ -176,6 +176,9 @@ def _segformer_segment(
     if "face_base" in raw_masks and "body" in raw_masks:
         _add_neck(raw_masks, fg_mask, h, w)
 
+    # SAM2 seed expansion: expand SegFormer seeds into full masks
+    _sam2_expand_seeds(raw_masks, image, fg_mask, h, w, config)
+
     # Detect weapons/props and move from body to accessory (if enabled)
     if config.weapon_detection != "none":
         _detect_weapons_gdino(raw_masks, image, fg_mask, h, w, config)
@@ -187,6 +190,176 @@ def _segformer_segment(
     _assign_uncovered_smart(raw_masks, fg_mask, h, w)
 
     return raw_masks
+
+
+def _sam2_expand_seeds(
+    masks: dict[str, np.ndarray],
+    image: Image.Image,
+    fg_mask: np.ndarray,
+    h: int, w: int,
+    config: PipelineConfig,
+) -> None:
+    """Expand SegFormer seed masks using SAM2 point prompts.
+
+    When SegFormer coverage is low, each classified region is used as a "seed".
+    SAM2 is prompted with points sampled from the seed to expand it into a
+    more complete mask, boosting overall coverage.
+    """
+    from illust2psd.utils.mask_utils import remove_small_components
+
+    covered = _union_masks(masks) if masks else np.zeros((h, w), dtype=bool)
+    fg_count = int(np.sum(fg_mask))
+    covered_count = int(np.sum(covered & fg_mask))
+    coverage = covered_count / max(1, fg_count)
+
+    # Only activate if coverage is below threshold
+    if coverage >= 0.80:
+        logger.debug(f"SAM2 expansion skipped: coverage {coverage:.0%} >= 80%")
+        return
+
+    logger.info(f"SAM2 seed expansion: coverage {coverage:.0%}, expanding {len(masks)} parts")
+
+    try:
+        from illust2psd.models.model_manager import ModelManager
+
+        predictor = ModelManager.get().get_sam2_predictor(config.device)
+        img_arr = np.array(image.convert("RGB"))
+        predictor.set_image(img_arr)
+    except Exception as e:
+        logger.warning(f"SAM2 expansion failed to load: {e}")
+        return
+
+    uncovered = fg_mask & ~covered
+
+    # For each part, sample points and expand with SAM2
+    # Process larger parts first (body, hair) as they benefit most
+    parts_by_size = sorted(masks.keys(), key=lambda k: -np.sum(masks[k]))
+
+    for part_id in parts_by_size:
+        seed = masks[part_id]
+        seed_px = int(np.sum(seed))
+        if seed_px < 50:
+            continue
+
+        # Sample prompt points from the seed region
+        pos_points = _sample_seed_points(seed, n=5)
+        if len(pos_points) < 2:
+            continue
+
+        # Sample negative points from OTHER parts (helps SAM2 distinguish)
+        neg_points = []
+        for other_id, other_mask in masks.items():
+            if other_id == part_id or not np.any(other_mask):
+                continue
+            other_pts = _sample_seed_points(other_mask, n=1)
+            neg_points.extend(other_pts)
+        neg_points = neg_points[:5]  # Cap at 5 negative points
+
+        all_points = pos_points + neg_points
+        all_labels = [1] * len(pos_points) + [0] * len(neg_points)
+
+        point_coords = np.array(all_points, dtype=np.float32)
+        point_labels = np.array(all_labels, dtype=np.int32)
+
+        try:
+            pred_masks, scores, _ = predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=True,
+            )
+        except Exception as e:
+            logger.debug(f"SAM2 expansion failed for {part_id}: {e}")
+            continue
+
+        # Pick the mask that best extends the seed while staying in uncovered+seed area
+        best_mask = None
+        best_score = -1
+        for m, s in zip(pred_masks, scores):
+            candidate = m.astype(bool) & fg_mask
+            # How much of the candidate overlaps with existing seed?
+            seed_overlap = np.sum(candidate & seed) / max(1, seed_px)
+            # How much new area does it claim from uncovered?
+            new_area = np.sum(candidate & uncovered)
+            # How much does it steal from OTHER parts? (bad)
+            other_parts_mask = covered & ~seed
+            stolen = np.sum(candidate & other_parts_mask)
+
+            # Good expansion: high seed overlap, substantial new area, minimal stealing
+            if seed_overlap < 0.5:
+                continue  # Must overlap at least 50% of original seed
+            if stolen > new_area * 0.3:
+                continue  # Don't steal more than 30% of what you gain
+
+            quality = seed_overlap * 0.3 + (new_area / max(1, fg_count)) * 10 - (stolen / max(1, fg_count)) * 20
+            if quality > best_score:
+                best_score = quality
+                best_mask = candidate
+
+        if best_mask is None:
+            continue
+
+        # Only take NEW pixels (uncovered), don't steal from other parts
+        expansion = best_mask & uncovered
+        expansion = remove_small_components(expansion, min_pixels=50)
+        exp_count = int(np.sum(expansion))
+
+        if exp_count < 50:
+            continue
+
+        masks[part_id] = seed | expansion
+        uncovered = uncovered & ~expansion
+        covered = covered | expansion
+
+        logger.debug(f"SAM2 expanded {part_id}: +{exp_count} px (seed {seed_px} → {seed_px + exp_count})")
+
+    new_coverage = int(np.sum(covered & fg_mask)) / max(1, fg_count)
+    logger.info(f"SAM2 expansion done: coverage {coverage:.0%} → {new_coverage:.0%}")
+
+
+def _sample_seed_points(mask: np.ndarray, n: int = 5) -> list[list[float]]:
+    """Sample n representative points from a boolean mask.
+
+    Returns points as [[x, y], ...] in image coordinates.
+    Samples: centroid + points near boundary for better SAM2 coverage.
+    """
+    ys, xs = np.where(mask)
+    if len(ys) < 10:
+        return [[float(xs.mean()), float(ys.mean())]] if len(ys) > 0 else []
+
+    points = []
+
+    # 1. Centroid
+    cx, cy = float(xs.mean()), float(ys.mean())
+    points.append([cx, cy])
+
+    if n <= 1:
+        return points
+
+    # 2. Sample from different spatial regions of the mask
+    # Divide the mask bounding box into quadrants and sample from each
+    y_min, y_max = ys.min(), ys.max()
+    x_min, x_max = xs.min(), xs.max()
+    y_mid = (y_min + y_max) / 2
+    x_mid = (x_min + x_max) / 2
+
+    quadrants = [
+        (xs < x_mid) & (ys < y_mid),  # top-left
+        (xs >= x_mid) & (ys < y_mid),  # top-right
+        (xs < x_mid) & (ys >= y_mid),  # bottom-left
+        (xs >= x_mid) & (ys >= y_mid),  # bottom-right
+    ]
+
+    for q_filter in quadrants:
+        if len(points) >= n:
+            break
+        q_idx = np.where(q_filter)[0]
+        if len(q_idx) == 0:
+            continue
+        # Pick a random point near the center of this quadrant
+        idx = q_idx[len(q_idx) // 2]
+        points.append([float(xs[idx]), float(ys[idx])])
+
+    return points[:n]
 
 
 def _detect_weapons_gdino(
