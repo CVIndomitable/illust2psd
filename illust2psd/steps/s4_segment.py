@@ -194,10 +194,10 @@ def _detect_weapons_gdino(
     fg_mask: np.ndarray,
     h: int, w: int,
 ) -> None:
-    """Use Grounding DINO to detect weapons/props and move them from body to accessory.
+    """Use Grounding DINO + SAM2 to detect and segment weapons/props from body.
 
-    SegFormer ATR classifies weapons overlapping clothing as "upper-clothes" (body).
-    This step uses open-vocabulary detection to find weapon regions and reclassify them.
+    Pipeline: GDINO detects weapon bboxes → SAM2 refines each bbox into a precise
+    mask using center-point prompt → non-skin mask pixels move from body to accessory.
     """
     body = masks.get("body")
     if body is None or np.sum(body) < 500:
@@ -210,9 +210,6 @@ def _detect_weapons_gdino(
         processor, model = ModelManager.get().get_grounding_dino()
 
         rgb = image.convert("RGB")
-
-        # Prompt for common non-human elements in game character art.
-        # Avoid ambiguous words: "bow" matches ribbons/ties, "staff" matches full body.
         text = "weapon. sword. gun. cannon. shield. lance. spear. axe. rifle. battleship turret. mechanical equipment."
 
         inputs = processor(images=rgb, text=text, return_tensors="pt")
@@ -222,12 +219,12 @@ def _detect_weapons_gdino(
         results = processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
-            threshold=0.40,
-            text_threshold=0.40,
+            threshold=0.35,
+            text_threshold=0.35,
             target_sizes=[(h, w)],
         )[0]
 
-        boxes = results["boxes"]  # (N, 4) in xyxy format
+        boxes = results["boxes"]
         scores = results["scores"]
         labels = results["labels"]
 
@@ -235,64 +232,100 @@ def _detect_weapons_gdino(
             logger.debug("Grounding DINO: no weapons detected")
             return
 
-        # Build weapon region mask from detected bounding boxes
-        # Filter: reject boxes that are too large (>20% of foreground area = false positive)
+        # Collect valid bbox centers for SAM2 refinement
         fg_area = int(np.sum(fg_mask))
         body_area = int(np.sum(body))
-        max_box_area = fg_area * 0.20
+        # Skip bboxes larger than 60% of foreground (clearly whole-character false positive)
+        max_box_area = fg_area * 0.60
 
-        weapon_mask = np.zeros((h, w), dtype=bool)
-        for i, (box, score, label) in enumerate(zip(boxes, scores, labels)):
+        sam2_points = []
+        for box, score, label in zip(boxes, scores, labels):
             x1, y1, x2, y2 = box.int().tolist()
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(w, x2), min(h, y2)
             box_area = (x2 - x1) * (y2 - y1)
             if box_area > max_box_area:
-                logger.debug(f"Grounding DINO: '{label}' score={score:.2f} box=({x1},{y1},{x2},{y2}) — SKIPPED (too large: {box_area} > {int(max_box_area)})")
+                logger.debug(f"GDINO: '{label}' score={score:.2f} box=({x1},{y1},{x2},{y2}) — skip (>60% fg)")
                 continue
-            weapon_mask[y1:y2, x1:x2] = True
-            logger.debug(f"Grounding DINO: '{label}' score={score:.2f} box=({x1},{y1},{x2},{y2})")
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            sam2_points.append((cx, cy, label, score))
+            logger.debug(f"GDINO: '{label}' score={score:.2f} box=({x1},{y1},{x2},{y2}) → SAM2 point ({int(cx)},{int(cy)})")
 
-        # Only move body pixels that are in weapon regions AND not skin-colored
-        img_rgb = np.array(rgb)
-        weapon_body = weapon_mask & body
-        if not np.any(weapon_body):
+        if not sam2_points:
+            logger.debug("Grounding DINO: no valid weapon boxes for SAM2")
             return
 
-        # Filter: keep only non-skin pixels (weapons are metallic, not skin)
-        skin_in_weapon = _is_skin_colored(img_rgb, weapon_body, min_ratio=0.0)
-        # If > 40% of weapon-body pixels are skin, it's probably a false positive
-        # (detected the character's body as a weapon)
-        if np.any(weapon_body):
-            ycrcb = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2YCrCb)
-            pixels = ycrcb[weapon_body]
-            skin = (
-                (pixels[:, 0] > 100)
-                & (pixels[:, 1] >= 130) & (pixels[:, 1] <= 180)
-                & (pixels[:, 2] >= 70) & (pixels[:, 2] <= 135)
-            )
-            skin_ratio = np.sum(skin) / len(pixels)
-            if skin_ratio > 0.40:
-                logger.debug(f"Grounding DINO: weapon region is {skin_ratio:.0%} skin, skipping (false positive)")
-                return
+        # SAM2 refinement: get precise weapon masks from bbox center points
+        mgr = ModelManager.get()
+        predictor = mgr.get_sam2_predictor("mps")
+        img_arr = np.array(rgb)
+        predictor.set_image(img_arr)
 
-        # Safety: don't move more than 50% of body (would destroy the layer)
-        to_move = weapon_body
-        count = int(np.sum(to_move))
+        weapon_mask = np.zeros((h, w), dtype=bool)
+        for cx, cy, label, score in sam2_points:
+            point_coords = np.array([[cx, cy]], dtype=np.float32)
+            point_labels = np.array([1], dtype=np.int32)
+
+            pred_masks, pred_scores, _ = predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=True,
+            )
+
+            # Pick the best mask that overlaps mostly with body (not hair/face)
+            best_mask = None
+            best_body_overlap = 0
+            for m, s in zip(pred_masks, pred_scores):
+                candidate = m.astype(bool)
+                body_overlap = np.sum(candidate & body) / max(1, np.sum(candidate))
+                # Prefer masks that are mostly within the body region
+                # and not too large (< 40% of body)
+                cand_in_body = np.sum(candidate & body)
+                if cand_in_body > body_area * 0.40:
+                    continue
+                if body_overlap > best_body_overlap:
+                    best_body_overlap = body_overlap
+                    best_mask = candidate
+
+            if best_mask is not None and best_body_overlap > 0.3:
+                # Only keep the part that overlaps with body
+                refined = best_mask & body
+                weapon_mask |= refined
+                logger.debug(f"SAM2 weapon '{label}': {int(np.sum(refined))} px (body overlap {best_body_overlap:.0%})")
+
+        if not np.any(weapon_mask):
+            return
+
+        # Skin check: if the SAM2 weapon mask is mostly skin, it's a false positive
+        ycrcb = cv2.cvtColor(img_arr, cv2.COLOR_RGB2YCrCb)
+        weapon_pixels = ycrcb[weapon_mask]
+        skin = (
+            (weapon_pixels[:, 0] > 100)
+            & (weapon_pixels[:, 1] >= 130) & (weapon_pixels[:, 1] <= 180)
+            & (weapon_pixels[:, 2] >= 70) & (weapon_pixels[:, 2] <= 135)
+        )
+        skin_ratio = np.sum(skin) / len(weapon_pixels)
+        if skin_ratio > 0.35:
+            logger.debug(f"GDINO+SAM2: weapon mask is {skin_ratio:.0%} skin, skipping (false positive)")
+            return
+
+        # Safety: don't move more than 40% of body
+        count = int(np.sum(weapon_mask))
+        if count > body_area * 0.40:
+            logger.debug(f"GDINO+SAM2: would move {count}/{body_area} body px ({count/body_area:.0%}), skipping")
+            return
+
         if count < 100:
             return
-        if count > body_area * 0.50:
-            logger.debug(f"Grounding DINO: would move {count}/{body_area} body px ({count/body_area:.0%}), capping to preserve body")
-            return
 
-        masks["body"] = body & ~to_move
+        masks["body"] = body & ~weapon_mask
         masks.setdefault("accessory", np.zeros((h, w), dtype=bool))
-        masks["accessory"] |= to_move
+        masks["accessory"] |= weapon_mask
 
-        logger.debug(f"Grounding DINO: moved {count} body px → accessory (weapon regions)")
+        logger.debug(f"GDINO+SAM2: moved {count} body px → accessory")
 
     except Exception as e:
-        logger.warning(f"Grounding DINO weapon detection failed: {e}, skipping")
+        logger.warning(f"GDINO+SAM2 weapon detection failed: {e}, skipping")
 
 
 def _split_hair(
