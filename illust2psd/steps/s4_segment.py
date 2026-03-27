@@ -886,10 +886,11 @@ def _assign_uncovered_smart(
         head_region[:int(head_bottom), :] = True
 
         hair_parts = {"front_hair", "back_hair"}
+        part_ids = list(masks.keys())
 
+        # Two label maps: one with hair (for head region), one without (for body region)
         label_map_full = np.zeros((h, w), dtype=np.int32)
         label_map_no_hair = np.zeros((h, w), dtype=np.int32)
-        part_ids = list(masks.keys())
 
         for i, pid in enumerate(part_ids, 1):
             label_map_full[masks[pid]] = i
@@ -912,24 +913,18 @@ def _assign_uncovered_smart(
         near_body = near_uncovered & ~head_region
 
         for i, pid in enumerate(part_ids, 1):
+            # Head region: allow hair (for hairline gaps near face)
             head_px = near_head & (nearest_full == i)
             if np.any(head_px):
                 masks[pid] |= head_px
 
+            # Body region: non-hair only (prevents back_hair garbage)
             if pid not in hair_parts:
                 body_px = near_body & (nearest_no_hair == i)
                 if np.any(body_px):
                     masks[pid] |= body_px
 
     # --- Far uncovered + remaining → accessory ---
-    still_uncovered = fg_mask & ~_union_masks(masks)
-    for i, pid in enumerate(part_ids, 1):
-        if pid not in non_body_parts:
-            body_px = near_body & (nearest_no_hair == i)
-            if np.any(body_px):
-                masks[pid] |= body_px
-
-    # --- Everything else (far body-region) → accessory ---
     still_uncovered = fg_mask & ~_union_masks(masks)
 
     if np.any(still_uncovered):
