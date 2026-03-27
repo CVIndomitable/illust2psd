@@ -47,9 +47,32 @@ def extract_foreground(
 
     # Strategy 1: Use existing alpha channel
     if has_transparent_bg:
+        alpha_mask = arr[:, :, 3] > 10
+        alpha_ratio = np.sum(alpha_mask) / max(1, alpha_mask.size)
+
+        if alpha_ratio > 0.70:
+            # Alpha covers >70% of canvas — likely a baked-in scene background.
+            # Run ISNet on the RGB to try separating character from scene.
+            logger.warning(
+                f"Alpha covers {alpha_ratio:.0%} of canvas — possible baked-in scene. "
+                "Running ISNet to refine foreground."
+            )
+            try:
+                isnet_mask = _isnet_segment(arr, config)
+                isnet_mask = _postprocess_mask(isnet_mask, config)
+                # Use the intersection: ISNet foreground AND alpha foreground
+                refined = isnet_mask & alpha_mask
+                refined_ratio = np.sum(refined) / max(1, alpha_mask.size)
+                if refined_ratio > 0.05:  # ISNet found something reasonable
+                    logger.info(f"ISNet refined foreground: {alpha_ratio:.0%} → {refined_ratio:.0%}")
+                    return ForegroundResult(mask=refined, method="alpha+isnet")
+                else:
+                    logger.info("ISNet refinement too aggressive, using alpha as-is")
+            except Exception as e:
+                logger.warning(f"ISNet refinement failed: {e}, using alpha as-is")
+
         logger.info("Using existing alpha channel for foreground mask")
-        mask = arr[:, :, 3] > 10
-        mask = _postprocess_mask(mask, config)
+        mask = _postprocess_mask(alpha_mask, config)
         return ForegroundResult(mask=mask, method="alpha")
 
     # Strategy 2: ISNet anime segmentation
@@ -145,8 +168,16 @@ def _grabcut_segment(arr: np.ndarray) -> np.ndarray:
 
 def _postprocess_mask(mask: np.ndarray, config: PipelineConfig) -> np.ndarray:
     """Clean up foreground mask."""
-    # Morphological close
+    from illust2psd.utils.mask_utils import remove_small_components
+
+    # Morphological close (fills small gaps)
     mask = close_mask(mask, config.mask_close_kernel)
-    # Fill holes
+    # Additional close with larger kernel to seal ISNet edge gaps on dark backgrounds
+    mask = close_mask(mask, max(config.mask_close_kernel, 7))
+    # Fill interior holes
     mask = fill_holes(mask)
+    # Remove small disconnected fragments (ISNet noise on colored backgrounds)
+    h, w = mask.shape
+    min_fg_px = max(200, int(h * w * 0.001))  # At least 0.1% of image
+    mask = remove_small_components(mask, min_pixels=min_fg_px)
     return mask.astype(bool)

@@ -31,7 +31,7 @@ class PipelineConfig:
 
     # Image processing
     max_working_size: int = 2048
-    min_image_size: int = 256
+    min_image_size: int = 128
     max_image_size: int = 4096
 
     # Segmentation

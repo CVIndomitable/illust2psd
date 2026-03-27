@@ -119,8 +119,9 @@ def convert(
 @click.argument("input_dir", type=click.Path(exists=True))
 @click.option("-o", "--output-dir", default=None, help="Output directory (default: input_dir/psd_output)")
 @click.option("--max-size", default=2048, help="Max working size")
-@click.option("--segmentation-backend", type=click.Choice(["segformer", "sam2", "heuristic"]), default="heuristic")
+@click.option("--segmentation-backend", type=click.Choice(["segformer", "sam2", "heuristic"]), default="segformer")
 @click.option("--foreground-model", type=click.Choice(["isnet", "rembg", "grabcut"]), default="isnet")
+@click.option("--weapon-detection", type=click.Choice(["gdino-sam2", "gdino-bbox", "none"]), default="gdino-sam2")
 @click.option("--inpaint-backend", type=click.Choice(["lama", "opencv", "none"]), default="opencv")
 @click.option("--device", type=click.Choice(["cuda", "cpu", "mps"]), default="mps")
 @click.option("--no-inpaint", is_flag=True)
@@ -132,6 +133,7 @@ def batch(
     max_size: int,
     segmentation_backend: str,
     foreground_model: str,
+    weapon_detection: str,
     inpaint_backend: str,
     device: str,
     no_inpaint: bool,
@@ -161,7 +163,8 @@ def batch(
 
     config = _build_config(
         max_size=max_size, segmentation_backend=segmentation_backend,
-        foreground_model=foreground_model, inpaint_backend=inpaint_backend,
+        foreground_model=foreground_model, weapon_detection=weapon_detection,
+        inpaint_backend=inpaint_backend,
         device=device, no_inpaint=no_inpaint, verbose=verbose,
     )
 
