@@ -176,8 +176,9 @@ def _segformer_segment(
     if "face_base" in raw_masks and "body" in raw_masks:
         _add_neck(raw_masks, fg_mask, h, w)
 
-    # Detect weapons/props with Grounding DINO and move from body to accessory
-    _detect_weapons_gdino(raw_masks, image, fg_mask, h, w)
+    # Detect weapons/props and move from body to accessory (if enabled)
+    if config.weapon_detection != "none":
+        _detect_weapons_gdino(raw_masks, image, fg_mask, h, w, config)
 
     # Recover hair-colored pixels misclassified as body (long hair problem)
     _recover_hair_from_body(raw_masks, image, fg_mask)
@@ -193,12 +194,16 @@ def _detect_weapons_gdino(
     image: Image.Image,
     fg_mask: np.ndarray,
     h: int, w: int,
+    config: PipelineConfig | None = None,
 ) -> None:
-    """Use Grounding DINO + SAM2 to detect and segment weapons/props from body.
+    """Use Grounding DINO (+ optional SAM2) to detect and segment weapons/props from body.
 
-    Pipeline: GDINO detects weapon bboxes → SAM2 refines each bbox into a precise
-    mask using center-point prompt → non-skin mask pixels move from body to accessory.
+    Modes (via config.weapon_detection):
+    - "gdino-sam2": GDINO bbox → SAM2 precise mask (best quality)
+    - "gdino-bbox": GDINO bbox only, small boxes directly applied (faster, less precise)
+    - "none": skip (handled by caller)
     """
+    use_sam2 = config is None or config.weapon_detection == "gdino-sam2"
     body = masks.get("body")
     if body is None or np.sum(body) < 500:
         return
@@ -232,37 +237,44 @@ def _detect_weapons_gdino(
             logger.debug("Grounding DINO: no weapons detected")
             return
 
-        # Collect valid bbox centers for SAM2 refinement
+        # Collect valid detections
         fg_area = int(np.sum(fg_mask))
         body_area = int(np.sum(body))
-        # Skip bboxes larger than 60% of foreground (clearly whole-character false positive)
-        max_box_area = fg_area * 0.60
+        max_box_area = fg_area * (0.60 if use_sam2 else 0.20)
 
-        sam2_points = []
+        detections = []  # (x1,y1,x2,y2, cx,cy, label, score)
         for box, score, label in zip(boxes, scores, labels):
             x1, y1, x2, y2 = box.int().tolist()
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(w, x2), min(h, y2)
             box_area = (x2 - x1) * (y2 - y1)
             if box_area > max_box_area:
-                logger.debug(f"GDINO: '{label}' score={score:.2f} box=({x1},{y1},{x2},{y2}) — skip (>60% fg)")
+                logger.debug(f"GDINO: '{label}' score={score:.2f} box=({x1},{y1},{x2},{y2}) — skip (too large)")
                 continue
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-            sam2_points.append((cx, cy, label, score))
-            logger.debug(f"GDINO: '{label}' score={score:.2f} box=({x1},{y1},{x2},{y2}) → SAM2 point ({int(cx)},{int(cy)})")
+            detections.append((x1, y1, x2, y2, cx, cy, label, score))
+            mode = "SAM2" if use_sam2 else "bbox"
+            logger.debug(f"GDINO: '{label}' score={score:.2f} box=({x1},{y1},{x2},{y2}) → {mode}")
 
-        if not sam2_points:
-            logger.debug("Grounding DINO: no valid weapon boxes for SAM2")
+        if not detections:
+            logger.debug("Grounding DINO: no valid weapon detections")
             return
 
-        # SAM2 refinement: get precise weapon masks from bbox center points
-        mgr = ModelManager.get()
-        predictor = mgr.get_sam2_predictor("mps")
         img_arr = np.array(rgb)
-        predictor.set_image(img_arr)
-
         weapon_mask = np.zeros((h, w), dtype=bool)
-        for cx, cy, label, score in sam2_points:
+
+        if use_sam2:
+            # SAM2 refinement: precise weapon masks from bbox center points
+            mgr = ModelManager.get()
+            device = config.device if config else "mps"
+            predictor = mgr.get_sam2_predictor(device)
+            predictor.set_image(img_arr)
+
+        for x1, y1, x2, y2, cx, cy, label, score in detections:
+            if not use_sam2:
+                # gdino-bbox mode: use raw bounding box intersected with body
+                weapon_mask[y1:y2, x1:x2] = True
+                continue
             point_coords = np.array([[cx, cy]], dtype=np.float32)
             point_labels = np.array([1], dtype=np.int32)
 

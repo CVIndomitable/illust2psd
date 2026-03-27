@@ -40,6 +40,9 @@ class PipelineConfig:
     sam2_checkpoint: str = "sam2_hiera_large"
     pose_backend: str = "mediapipe"  # "mediapipe" | "dwpose" | "heuristic"
 
+    # Weapon/prop detection — separate non-human elements from body
+    weapon_detection: str = "gdino-sam2"  # "gdino-sam2" | "gdino-bbox" | "none"
+
     # Face parsing
     face_parser: str = "sam2"  # "bisenet" | "sam2" | "heuristic"
     face_padding_ratio: float = 0.2

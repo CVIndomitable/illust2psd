@@ -28,8 +28,9 @@ def _setup_logging(verbose: bool) -> None:
 
 def _build_config(
     max_size: int = 2048,
-    segmentation_backend: str = "heuristic",
+    segmentation_backend: str = "segformer",
     foreground_model: str = "isnet",
+    weapon_detection: str = "gdino-sam2",
     inpaint_backend: str = "opencv",
     device: str = "mps",
     no_inpaint: bool = False,
@@ -41,6 +42,7 @@ def _build_config(
         max_working_size=max_size,
         segmentation_backend=segmentation_backend,
         foreground_model=foreground_model,
+        weapon_detection=weapon_detection,
         inpaint_backend="none" if no_inpaint else inpaint_backend,
         device=device,
         dump_masks=dump_masks,
@@ -64,6 +66,7 @@ def main(ctx: click.Context) -> None:
 @click.option("--max-size", default=2048, help="Max working size (longest side)")
 @click.option("--segmentation-backend", type=click.Choice(["segformer", "sam2", "heuristic"]), default="segformer", help="Segmentation backend")
 @click.option("--foreground-model", type=click.Choice(["isnet", "rembg", "grabcut"]), default="isnet", help="Foreground extraction model")
+@click.option("--weapon-detection", type=click.Choice(["gdino-sam2", "gdino-bbox", "none"]), default="gdino-sam2", help="Weapon/prop detection mode")
 @click.option("--inpaint-backend", type=click.Choice(["lama", "opencv", "none"]), default="opencv", help="Inpainting backend")
 @click.option("--device", type=click.Choice(["cuda", "cpu", "mps"]), default="mps", help="Compute device")
 @click.option("--no-inpaint", is_flag=True, help="Skip inpainting")
@@ -76,6 +79,7 @@ def convert(
     max_size: int,
     segmentation_backend: str,
     foreground_model: str,
+    weapon_detection: str,
     inpaint_backend: str,
     device: str,
     no_inpaint: bool,
@@ -91,7 +95,8 @@ def convert(
 
     config = _build_config(
         max_size=max_size, segmentation_backend=segmentation_backend,
-        foreground_model=foreground_model, inpaint_backend=inpaint_backend,
+        foreground_model=foreground_model, weapon_detection=weapon_detection,
+        inpaint_backend=inpaint_backend,
         device=device, no_inpaint=no_inpaint, dump_masks=dump_masks,
         dump_layers=dump_layers, verbose=verbose,
     )
