@@ -671,17 +671,36 @@ def _assign_uncovered_smart(
     # Compute distance from any classified region
     dist_from_classified = ndi.distance_transform_edt(~covered)
 
-    # Margin: pixels within this distance get nearest-neighbor assignment.
-    # Beyond this → accessory. Use ~3% of image diagonal as margin.
+    # Dynamic margin based on coverage ratio:
+    # High coverage (>80%): 3% diagonal — trust nearest-neighbor for small gaps
+    # Low coverage (<40%): 1% diagonal — be conservative, send more to accessory
+    fg_count = int(np.sum(fg_mask))
+    covered_count = int(np.sum(covered))
+    coverage_ratio = covered_count / max(1, fg_count)
+
     diag = (h ** 2 + w ** 2) ** 0.5
-    margin_px = max(20, int(diag * 0.03))
+    if coverage_ratio >= 0.80:
+        margin_frac = 0.03
+    elif coverage_ratio >= 0.50:
+        # Linear interpolation: 0.50→0.015, 0.80→0.03
+        margin_frac = 0.015 + (coverage_ratio - 0.50) * (0.015 / 0.30)
+    else:
+        margin_frac = 0.01  # Very conservative for low coverage
+
+    margin_px = max(15, int(diag * margin_frac))
+    logger.debug(f"Coverage: {coverage_ratio:.0%}, margin: {margin_px}px ({margin_frac:.3f}×diag)")
 
     near_uncovered = uncovered & (dist_from_classified <= margin_px)
     far_uncovered = uncovered & (dist_from_classified > margin_px)
 
+    if coverage_ratio < 0.50:
+        logger.warning(
+            f"Low SegFormer coverage ({coverage_ratio:.0%}). "
+            f"Many pixels will go to accessory. Consider --segmentation-backend sam2."
+        )
+
     # --- Near uncovered: assign to nearest part (with head/hair constraints) ---
     if np.any(near_uncovered):
-        # Find head boundary
         head_bottom = h * 0.25
         for pid in ["face_base", "front_hair"]:
             if pid in masks and np.any(masks[pid]):
@@ -729,15 +748,20 @@ def _assign_uncovered_smart(
                 if np.any(body_px):
                     masks[pid] |= body_px
 
-    # --- Far uncovered: all goes to accessory (weapons, rigging, props) ---
-    # Also collect any still-unassigned near pixels (e.g. body-region hair-only area)
+    # --- Far uncovered + remaining → accessory ---
     still_uncovered = fg_mask & ~_union_masks(masks)
-    far_total = far_uncovered | (still_uncovered & ~far_uncovered)
-    far_total = fg_mask & ~_union_masks(masks)  # recompute to be precise
+    for i, pid in enumerate(part_ids, 1):
+        if pid not in non_body_parts:
+            body_px = near_body & (nearest_no_hair == i)
+            if np.any(body_px):
+                masks[pid] |= body_px
 
-    if np.any(far_total):
+    # --- Everything else (far body-region) → accessory ---
+    still_uncovered = fg_mask & ~_union_masks(masks)
+
+    if np.any(still_uncovered):
         masks.setdefault("accessory", np.zeros((h, w), dtype=bool))
-        masks["accessory"] |= far_total
+        masks["accessory"] |= still_uncovered
 
     near_count = int(np.sum(near_uncovered))
     far_count = int(np.sum(far_uncovered))
